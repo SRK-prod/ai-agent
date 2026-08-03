@@ -1,0 +1,7 @@
+# Consumed by meeting_copilot.utils.logging.configure_logging()
+sink: logs/meeting_copilot.log
+level: DEBUG
+rotation: "50 MB"
+retention: "14 days"
+format: "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}"
+console: true

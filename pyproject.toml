@@ -1,0 +1,84 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meeting-copilot"
+version = "0.1.0"
+description = "macOS desktop agent that listens to meeting audio, ignores the user's own voice, and surfaces Claude-generated answers to technical questions asked by other participants."
+requires-python = ">=3.13"
+readme = "README.md"
+
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "uvloop>=0.21; sys_platform != 'win32'",
+    "websockets>=13.1",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "pyyaml>=6.0",
+    "sounddevice>=0.5",
+    "numpy>=1.26,<2.0",
+    "scipy>=1.14",
+    "noisereduce>=3.0",
+    "silero-vad>=5.1",
+    # Pinned to 2.7.0: newer torchaudio (2.8+) removed `torchaudio.AudioMetaData`,
+    # which pyannote.audio 3.4.0 still imports -- see docs/troubleshooting.md.
+    "torch==2.7.0",
+    "torchaudio==2.7.0",
+    "faster-whisper>=1.0",
+    # Apple Silicon GPU STT backend (stt.backend: mlx-whisper) -- ~15x faster than CPU here
+    "mlx-whisper>=0.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "pyannote.audio>=3.3",
+    # huggingface_hub 1.0+ removed the `use_auth_token` kwarg that pyannote.audio 3.4.0
+    # still passes internally to hf_hub_download() -- see docs/troubleshooting.md.
+    "huggingface_hub<1.0",
+    "qdrant-client>=1.12",
+    "sentence-transformers>=3.0",
+    "anthropic>=0.39",
+    "tiktoken>=0.8",
+    "redis>=5.2",
+    "PySide6>=6.8",
+    "pynput>=1.7",
+    "loguru>=0.7",
+    "prometheus-client>=0.21",
+    "tenacity>=9.0",
+    "sqlalchemy>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-benchmark>=5.1",
+    "pytest-cov>=6.0",
+    "playwright>=1.48",
+    "fakeredis>=2.26",
+    "ruff>=0.7",
+    "mypy>=1.13",
+    "pyinstaller>=6.11",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+meeting-copilot-enroll = "meeting_copilot.scripts_entry:enroll_voice_main"
+meeting-copilot-ingest = "meeting_copilot.scripts_entry:ingest_knowledge_main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: uses real ML models/hardware, not run in CI",
+    "e2e: end-to-end Playwright browser-meeting test, needs real audio routing",
+]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.mypy]
+python_version = "3.13"
+ignore_missing_imports = true

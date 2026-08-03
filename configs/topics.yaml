@@ -1,0 +1,96 @@
+# Pre-meeting knowledge topics. Edit this list, then run:
+#   make ingest
+# to chunk/embed/store each topic's material into Qdrant. Meeting-time
+# retrieval only ever searches Qdrant -- it never hits the network live.
+#
+# Each topic can point at local files/dirs and/or give Claude a research
+# brief to summarize into notes (done offline by scripts/ingest_knowledge.py,
+# never during a live meeting).
+#
+# Tuned for DevOps Manager / DevOps Architect interviews (14 years experience,
+# AI-stack familiarity) -- briefs ask for senior/leadership-level framing.
+topics:
+  - name: my-profile
+    # The candidate's own resume/profile -- grounds answers in their real projects,
+    # employers, metrics (25-30% cost reduction, 40% faster releases, 50+ microservices).
+    sources:
+      - data/profile/srikanth_profile.txt
+  - name: aws
+    sources: []
+    research_brief: "Core AWS services, common architecture patterns, cost optimization, security best practices."
+  - name: terraform
+    sources: []
+    research_brief: "Terraform modules, state management, common pitfalls, CI/CD integration."
+  - name: kubernetes
+    sources: []
+    research_brief: >
+      Kubernetes at architect level: cluster architecture, workload types, Helm,
+      operators, autoscaling (HPA/VPA/Karpenter), multi-tenancy, upgrade strategy,
+      cost control, common production incidents and their fixes, EKS specifics.
+  - name: ci-cd
+    sources: []
+    research_brief: >
+      CI/CD strategy for a DevOps architect: pipeline design principles, GitOps
+      (ArgoCD/Flux), Jenkins vs GitHub Actions vs GitLab tradeoffs, deployment
+      strategies (blue-green, canary, feature flags), artifact/supply-chain security,
+      measuring pipeline health (DORA metrics), migrating legacy pipelines.
+  - name: devops-leadership
+    sources: []
+    research_brief: >
+      DevOps Manager topics: building and scaling DevOps/platform teams, hiring and
+      mentoring engineers, driving DevOps culture adoption, stakeholder management,
+      prioritizing platform roadmap vs firefighting, measuring team success (DORA,
+      SPACE), handling conflict, budget/vendor decisions, leading through incidents.
+  - name: incident-management
+    sources: []
+    research_brief: >
+      SRE and incident management at senior level: SLO/SLI/error budgets, on-call
+      design, incident command, blameless postmortems, reducing MTTR, reliability
+      patterns (circuit breakers, retries, backpressure), chaos engineering,
+      escalation and communication during major incidents.
+  - name: mlops-ai
+    sources: []
+    research_brief: >
+      MLOps and AI in the DevOps stack: LLM application deployment patterns, RAG
+      architecture, model serving and versioning, GPU infrastructure, prompt/eval
+      pipelines, AI-assisted engineering tools (Copilot-class) and their rollout in
+      teams, AIOps for observability/anomaly detection, governance and cost control
+      for AI workloads.
+  - name: platform-engineering
+    sources: []
+    research_brief: >
+      Platform engineering: internal developer platforms, golden paths, Backstage,
+      self-service infrastructure, platform-as-product mindset, measuring platform
+      adoption, build vs buy decisions, relationship between platform/SRE/DevOps teams.
+  - name: devsecops
+    sources: []
+    research_brief: >
+      DevSecOps at architect level: shift-left security, SAST/DAST/SCA in pipelines,
+      secrets management, supply chain security (SBOM, sigstore), container/K8s
+      security hardening, compliance automation (SOC2, PCI), driving security
+      adoption without slowing delivery.
+  - name: migration-modernization
+    sources: []
+    research_brief: >
+      Cloud migration and modernization leadership: migration strategies (6 Rs),
+      monolith-to-microservices decomposition, datacenter-to-cloud programs, zero
+      downtime cutovers, stakeholder/risk management during migrations, cost and
+      timeline estimation, common failure modes of large migrations.
+  - name: observability
+    sources: []
+    research_brief: "Prometheus, Grafana, logging/tracing best practices, SLOs, OpenTelemetry adoption strategy, observability cost control."
+  - name: system-design
+    sources: []
+    research_brief: >
+      System design interview topics for infrastructure-heavy roles: designing
+      scalable web architectures, load balancing, caching layers, message queues,
+      data-store selection, multi-region and DR design, capacity planning,
+      articulating tradeoffs clearly.
+  - name: behavioral
+    sources: []
+    research_brief: >
+      Behavioral interview preparation for senior engineering leadership: STAR-format
+      answer structures for common questions (conflict, failure, influencing without
+      authority, delivering under pressure, difficult stakeholder, biggest technical
+      decision), framed for someone with 14 years of DevOps experience moving into
+      manager/architect roles.
