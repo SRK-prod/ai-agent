@@ -10,6 +10,7 @@ so it doesn't stall the asyncio event loop. See configs/settings.yaml
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 
 import torch
 from faster_whisper import WhisperModel
@@ -17,6 +18,7 @@ from faster_whisper import WhisperModel
 from meeting_copilot.cache.redis_cache import RedisCache
 from meeting_copilot.config import SttConfig, get_config
 from meeting_copilot.pipeline.events import DiarizedSegment, Transcript
+from meeting_copilot.stt.term_normalizer import normalize as normalize_terms
 from meeting_copilot.utils.logging import get_logger
 
 logger = get_logger()
@@ -53,8 +55,23 @@ class FasterWhisperEngine:
             language=self._cfg.language,
             condition_on_previous_text=True,
             vad_filter=False,  # our own Silero VAD already gated this to a speech segment
+            initial_prompt=self._cfg.vocabulary_hint,
         )
         return " ".join(s.text.strip() for s in segments).strip()
+
+
+def _is_hallucinated(text: str) -> bool:
+    """Whisper's most common failure mode on noisy/cross-talk/low-signal audio isn't
+    silence -- it's a repetition loop, the same word or short phrase output dozens of
+    times ('Disability Disability Disability...', 'diss diss diss...'). Real speech
+    essentially never repeats one word this often, so a high repetition ratio is a
+    reliable signal to discard the segment rather than treat it as real content."""
+    words = text.split()
+    if len(words) < 6:
+        return False
+    counts = Counter(w.lower().strip(".,!?") for w in words)
+    _most_common_word, most_common_count = counts.most_common(1)[0]
+    return most_common_count >= 5 and most_common_count / len(words) > 0.35
 
 
 def get_stt_engine(config: SttConfig | None = None):
@@ -85,6 +102,19 @@ class SttStage:
         )
         if not text:
             return None
+
+        if _is_hallucinated(text):
+            logger.warning(f"Discarding likely STT hallucination: {text[:80]!r}...")
+            return None
+
+        # Repair mis-transcribed technical vocabulary BEFORE question detection. Whisper
+        # mangles domain terms ("OOMCade" for OOMKilled), and the detector scores on keyword
+        # matches -- so without this a real technical question gets scored as noise and
+        # silently dropped. Deterministic, ~0.5ms, no model call.
+        normalized, repairs = normalize_terms(text)
+        if repairs:
+            logger.info(f"STT term recovery ({repairs}): {text[:60]!r} -> {normalized[:60]!r}")
+            text = normalized
 
         if await self._cache.seen_recently(diarized.speaker_id, text):
             logger.debug(f"Skipping duplicate utterance from {diarized.speaker_id}: {text!r}")

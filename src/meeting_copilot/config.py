@@ -34,6 +34,7 @@ class Secrets(BaseSettings):
     model_config = SettingsConfigDict(env_file=str(ENV_FILE), extra="ignore")
 
     anthropic_api_key: str | None = Field(default=None, alias="ANTHROPIC_API_KEY")
+    openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
     hf_token: str | None = Field(default=None, alias="HF_TOKEN")
     qdrant_url: str = Field(default="http://localhost:6333", alias="QDRANT_URL")
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
@@ -53,6 +54,13 @@ class Secrets(BaseSettings):
                 "ANTHROPIC_API_KEY", "calling the Anthropic Messages API (llm.backend=api)"
             )
         return self.anthropic_api_key
+
+    def require_openai_key(self) -> str:
+        if not self.openai_api_key:
+            raise MissingCredentialError(
+                "OPENAI_API_KEY", "calling the OpenAI API (llm.backend=openai)"
+            )
+        return self.openai_api_key
 
 
 class AudioConfig(BaseModel):
@@ -88,6 +96,41 @@ class SttConfig(BaseModel):
     chunk_seconds: float = 2.5
     chunk_overlap_seconds: float = 0.5
     language: str = "en"
+    vocabulary_hint: str = (
+        "LangChain, LangGraph, LlamaIndex, CrewAI, AutoGen, MCP, Model Context Protocol, "
+        "GenAI, Generative AI, Agentic AI, RAG, vector database, embeddings, Amazon Bedrock, "
+        "Claude Sonnet, Claude Haiku, Amazon Q in Connect, Amazon Connect, DIEZ Mobile, "
+        "Reach Mobile, JIRA, IAM, KMS, Lambda, DynamoDB, Aurora, OpenSearch, Terraform, "
+        "Kubernetes, Databricks, Kafka, Kinesis, CI/CD, DevSecOps, OpenTofu, Rancher Desktop, "
+        "AKS, EKS, RBAC, Azure DevOps, Key Vault, Azure Container Registry, Prometheus, "
+        "Grafana, OpenTelemetry, Loki, PowerShell, PaaS, multi-tenant, SOP, GitOps, ArgoCD, "
+        "Helm, Ansible, Istio, service mesh, "
+        # AIOps / SRE / observability vocabulary (EPAM Cloud AIOps Architect)
+        "AIOps, SRE, SLI, SLO, SLA, error budget, burn rate, MTTR, MTTD, toil, "
+        "observability, telemetry, cardinality, anomaly detection, event correlation, "
+        "root cause analysis, RCA, runbook, remediation, postmortem, blameless, "
+        "OOMKilled, CrashLoopBackOff, PodDisruptionBudget, Karpenter, Kyverno, "
+        "OPA Gatekeeper, Falco, Trivy, Cosign, Linkerd, Tempo, Mimir, Thanos, Cortex, "
+        "Alertmanager, PromQL, EFK, ELK, Datadog, AppDynamics, New Relic, Dynatrace, "
+        "BigPanda, Moogsoft, ServiceNow, Jaeger, tail sampling, RED metrics, USE method, "
+        "golden signals, vector store, pgvector, OpenSearch, Pinecone, Weaviate, Qdrant, "
+        "FAISS, embeddings, Titan Text Embeddings, Cohere Embed, reranking, BM25, "
+        "hybrid search, chunking, grounding, hallucination, guardrails, human-in-the-loop, "
+        "Bicep, ARM template, CloudFormation, Transit Gateway, ExpressRoute, Direct Connect, "
+        "landing zone, SCP, permission boundary, IRSA, Managed Identity, Entra ID, FinOps, "
+        # Wells Fargo Principal Engineer (AIOps) JD vocabulary
+        "Splunk, ITRS Geneos, Geneos, BigPanda, Moogsoft, Dynatrace, AppDynamics, "
+        "self-healing, closed-loop remediation, intelligent alerting, event-driven "
+        "architecture, Kafka, Kinesis, streaming, telemetry ingestion, data pipeline, "
+        "Ansible, playbook, forecasting, capacity forecasting, incident summarization, "
+        "knowledge mining, automated runbook generation, GitHub Copilot, Confluence, "
+        "target-state architecture, operating model, roadmap, stakeholder management, "
+        "model risk management, segregation of duties, change control, audit trail, "
+        "regulated, compliance, SOX, PCI, Wells Fargo, principal engineer"
+    )  # primes Whisper's decoder toward this domain's proper nouns/acronyms -- measured
+    # live: without this, "LangChain, LangGraph, LlamaIndex" transcribed as "line chain,
+    # line graph, non-index", "Gen AI" as "gender TV", "JIRA" as "PIA". Passed as
+    # initial_prompt, which biases decoding without forcing verbatim repetition.
 
 
 class QuestionDetectorConfig(BaseModel):
@@ -125,11 +168,12 @@ class QaBankConfig(BaseModel):
 
 
 class LlmConfig(BaseModel):
-    backend: Literal["cli", "api"] = "cli"
+    backend: Literal["cli", "api", "openai"] = "cli"
     cli_binary: str = "claude"
     cli_timeout_seconds: int = 180
     model: str = "claude-haiku-4-5-20251001"  # fastest model; answer quality is driven
     # mainly by the interview-format system prompt (see llm/prompt_templates.py)
+    openai_model: str = "gpt-4o"  # only used when backend=openai
     persona: str = (
         "You are a candidate with 14+ years of technology architecture experience "
         "interviewing for a senior-band Enterprise / AI Solution Architect role (also "

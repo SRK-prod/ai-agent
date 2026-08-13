@@ -27,6 +27,43 @@ from meeting_copilot.utils.logging import get_logger
 
 logger = get_logger()
 
+_RETRYABLE_ATTEMPTS = 3  # 1 initial + 2 retries
+_RETRY_BACKOFF_SECONDS = (0.5, 1.5)
+
+
+async def _stream_with_retry(
+    make_stream, *args, **kwargs
+) -> AsyncIterator[str]:
+    """Retries a streaming call, but ONLY before any chunk has been yielded -- that's
+    where transient failures (rate limits, connection blips, momentary 5xx) actually
+    happen in practice. A mid-stream failure after real content already reached the
+    candidate is not retried (retrying would duplicate/corrupt what's already shown),
+    so this doesn't compromise the fast-first-token behavior once a stream is flowing.
+    Measured live: a burst of concurrent OpenAI calls transiently failed 2/5 times with
+    no retry at all -- a single network blip mid-interview should not silently drop the
+    only answer the candidate has for that question."""
+    last_exc: Exception | None = None
+    for attempt in range(_RETRYABLE_ATTEMPTS):
+        try:
+            first = True
+            async for chunk in make_stream(*args, **kwargs):
+                first = False
+                yield chunk
+            return
+        except Exception as e:
+            if not first:
+                raise  # already yielded real content -- don't retry, don't duplicate
+            last_exc = e
+            if attempt < _RETRYABLE_ATTEMPTS - 1:
+                delay = _RETRY_BACKOFF_SECONDS[min(attempt, len(_RETRY_BACKOFF_SECONDS) - 1)]
+                logger.warning(
+                    f"LLM stream failed before any output (attempt {attempt + 1}/"
+                    f"{_RETRYABLE_ATTEMPTS}): {type(e).__name__}: {e} -- retrying in {delay}s"
+                )
+                await asyncio.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
+
 
 class _ClaudeBackend(Protocol):
     async def complete(self, prompt: str, system: str | None = None) -> str: ...
@@ -124,15 +161,28 @@ class ClaudeApiBackend:
         return [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
 
     async def complete(self, prompt: str, system: str | None = None) -> str:
-        response = await self._client.messages.create(
-            model=self._cfg.model,
-            max_tokens=self._cfg.max_tokens,
-            system=self._system_blocks(system),
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return "".join(block.text for block in response.content if block.type == "text").strip()
+        last_exc: Exception | None = None
+        for attempt in range(_RETRYABLE_ATTEMPTS):
+            try:
+                response = await self._client.messages.create(
+                    model=self._cfg.model,
+                    max_tokens=self._cfg.max_tokens,
+                    system=self._system_blocks(system),
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                return "".join(
+                    block.text for block in response.content if block.type == "text"
+                ).strip()
+            except Exception as e:
+                last_exc = e
+                if attempt < _RETRYABLE_ATTEMPTS - 1:
+                    delay = _RETRY_BACKOFF_SECONDS[min(attempt, len(_RETRY_BACKOFF_SECONDS) - 1)]
+                    logger.warning(f"Claude complete() failed, retrying in {delay}s: {e}")
+                    await asyncio.sleep(delay)
+        assert last_exc is not None
+        raise last_exc
 
-    async def stream(self, prompt: str, system: str | None = None) -> AsyncIterator[str]:
+    async def _raw_stream(self, prompt: str, system: str | None) -> AsyncIterator[str]:
         async with self._client.messages.stream(
             model=self._cfg.model,
             max_tokens=self._cfg.max_tokens,
@@ -141,6 +191,64 @@ class ClaudeApiBackend:
         ) as stream:
             async for text in stream.text_stream:
                 yield text
+
+    def stream(self, prompt: str, system: str | None = None) -> AsyncIterator[str]:
+        return _stream_with_retry(self._raw_stream, prompt, system)
+
+
+class OpenAiApiBackend:
+    """ChatGPT backend via OpenAI's Chat Completions API -- same _ClaudeBackend interface,
+    so ClaudeClient/orchestrator/answer_optimizer don't need to know which provider is
+    actually generating the answer. Added as a fallback option: if this backend errors,
+    switch configs/settings.yaml llm.backend back to "api" (Claude) immediately."""
+
+    def __init__(self, config: LlmConfig):
+        from openai import AsyncOpenAI
+
+        self._cfg = config
+        api_key = get_config().secrets.require_openai_key()
+        self._client = AsyncOpenAI(api_key=api_key)
+
+    def _messages(self, prompt: str, system: str | None):
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        return messages
+
+    async def complete(self, prompt: str, system: str | None = None) -> str:
+        last_exc: Exception | None = None
+        for attempt in range(_RETRYABLE_ATTEMPTS):
+            try:
+                response = await self._client.chat.completions.create(
+                    model=self._cfg.openai_model,
+                    max_tokens=self._cfg.max_tokens,
+                    messages=self._messages(prompt, system),
+                )
+                return (response.choices[0].message.content or "").strip()
+            except Exception as e:
+                last_exc = e
+                if attempt < _RETRYABLE_ATTEMPTS - 1:
+                    delay = _RETRY_BACKOFF_SECONDS[min(attempt, len(_RETRY_BACKOFF_SECONDS) - 1)]
+                    logger.warning(f"OpenAI complete() failed, retrying in {delay}s: {e}")
+                    await asyncio.sleep(delay)
+        assert last_exc is not None
+        raise last_exc
+
+    async def _raw_stream(self, prompt: str, system: str | None) -> AsyncIterator[str]:
+        stream = await self._client.chat.completions.create(
+            model=self._cfg.openai_model,
+            max_tokens=self._cfg.max_tokens,
+            messages=self._messages(prompt, system),
+            stream=True,
+        )
+        async for chunk in stream:
+            delta = chunk.choices[0].delta.content if chunk.choices else None
+            if delta:
+                yield delta
+
+    def stream(self, prompt: str, system: str | None = None) -> AsyncIterator[str]:
+        return _stream_with_retry(self._raw_stream, prompt, system)
 
 
 class ClaudeClient:
@@ -153,6 +261,8 @@ class ClaudeClient:
             self._backend = ClaudeCliBackend(self._cfg)
         elif self._cfg.backend == "api":
             self._backend = ClaudeApiBackend(self._cfg)
+        elif self._cfg.backend == "openai":
+            self._backend = OpenAiApiBackend(self._cfg)
         else:
             raise ValueError(f"Unknown llm.backend: {self._cfg.backend!r}")
         logger.info(f"ClaudeClient using backend={self._cfg.backend}")

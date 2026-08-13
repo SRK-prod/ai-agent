@@ -59,6 +59,14 @@ class DetectedQuestion:
     transcript: Transcript
     matched_keywords: list[str] = field(default_factory=list)
     ends_with_question_mark: bool = False
+    # True if the text grammatically reads as a question (a "?" or an interrogative
+    # opener like "how"/"what would you"). False for a detection that survived ONLY on a
+    # keyword match or technical-term density -- e.g. "production BigPanda application
+    # suddenly produces false alarms" matches the keyword "bigpanda" and is a valid,
+    # answerable sentence, but it is declarative, not an ask. The orchestrator uses this to
+    # avoid letting a keyword-dense scenario-setup sentence cut off an in-progress
+    # multi-sentence scenario buildup and get answered prematurely.
+    has_interrogative_signal: bool = True
 
 
 @dataclass

@@ -16,6 +16,7 @@ overwritten.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections.abc import Awaitable, Callable
 
@@ -27,7 +28,7 @@ from meeting_copilot.llm.answer_optimizer import AnswerOptimizer
 from meeting_copilot.llm.claude_client import ClaudeClient
 from meeting_copilot.llm.prompt_templates import build_system_prompt, build_user_prompt
 from meeting_copilot.nlp.question_detector import get_question_detector
-from meeting_copilot.pipeline.events import Answer, RetrievedContext, SpeechSegment
+from meeting_copilot.pipeline.events import Answer, RetrievedContext, SpeechSegment, Transcript
 from meeting_copilot.pipeline.metrics import PIPELINE_TOTAL_LATENCY_SECONDS, StageTimer
 from meeting_copilot.retrieval.hybrid_search import HybridSearcher
 from meeting_copilot.retrieval.qa_bank import QaBankStore
@@ -40,6 +41,265 @@ logger = get_logger()
 
 OnAnswer = Callable[[Answer], Awaitable[None]]
 OnPartialAnswer = Callable[[str], Awaitable[None]]
+
+# VAD's min_silence_ms gap can split one continuous, paused-and-continued question into
+# multiple segments. If the next segment from the SAME speaker arrives within this many
+# seconds of the previous one ending, treat it as a continuation and merge the text
+# instead of answering a fragment out of context.
+_FRAGMENT_MERGE_GAP_SECONDS = 3.0
+
+# An interviewer very often asks a question, pauses while you start thinking, then adds
+# qualifiers ("...and how would that change under load?"). Beyond the short merge gap above
+# we've usually already answered -- so within this longer window we re-answer the COMBINED
+# question and supersede the previous answer on the overlay, rather than answering the
+# addition in isolation with no idea what it refers to.
+_SUPERSEDE_WINDOW_SECONDS = 15.0
+
+# An interviewer describing a multi-sentence scenario ("Two services show correlated
+# anomalies with no dependency between them... a BigPanda alert fires for the payment
+# service... but infrastructure metrics look healthy...") pauses for breath between
+# sentences. Measured live 2026-08-13: gaps of 10-18s between those sentences. None of them
+# are questions on their own, and discarding them as "not a question" loses the scenario the
+# eventual question depends on -- observed live producing an answer grounded in the WRONG
+# prior Q&A (attached via the follow-up path) instead of the scenario actually spoken.
+_SCENARIO_CONTEXT_WINDOW_SECONDS = 25.0
+
+# Wait this long after speech stops before committing to an answer. Guards against
+# answering half a question when the interviewer is mid-thought ("...how would you design
+# an AIOps platform" [2s] "...for a bank with 10,000 services?"). Any new speech inside
+# this window cancels the timer and extends the question instead of starting a 2nd answer.
+# Kept deliberately short -- this is added directly to time-to-first-token.
+# Measured live 2026-08-13: generation itself is fast (TTFA 0.8-1.4s), but VAD silence
+# (1.0s) + debounce was adding ~2.2s of dead air BEFORE generation started -- the delay the
+# candidate actually feels. Cut to 0.5s: the supersede path already re-answers late
+# additions, so a long debounce is largely redundant protection paid for on every question.
+_QUESTION_DEBOUNCE_SECONDS = 0.5
+
+# How many (question, answer) pairs to keep for follow-up context.
+_CONVERSATION_MEMORY_TURNS = 3
+
+# Openers that mark a genuinely NEW question rather than a continuation of the previous one.
+# Without this check, a real follow-up question asked shortly after an answer would get
+# glued onto the previous question's text and answered as one confused hybrid.
+_NEW_QUESTION_OPENERS = (
+    "next question", "moving on", "let's move", "lets move", "another question",
+    "second question", "third question", "my next", "ok so now", "okay so now",
+    "let me ask", "different question", "switching", "one more question",
+    "let's talk about", "lets talk about", "changing topic", "different topic",
+    "moving to", "let's switch", "lets switch", "new topic",
+)
+
+# Bare drill-down questions a senior interviewer uses to challenge an answer. These are
+# short, high-context, and MEANINGLESS without the previous question and answer attached --
+# "Why not Kinesis?" answered standalone is a generic essay; answered with context it's a
+# crisp defence of a decision you just made.
+_FOLLOWUP_MARKERS = (
+    "why", "why not", "how", "what if", "what about", "how about", "and if",
+    "can you explain", "explain that", "elaborate", "go deeper", "tell me more",
+    "what else", "anything else", "give me an example", "for example", "such as",
+    "trade-off", "tradeoff", "trade off", "downside", "drawback", "risk",
+    "at scale", "how would you scale", "what would you do differently",
+    "but ", "however", "instead", "alternative", "versus", " vs ",
+)
+
+# ANAPHORIC REFERENCES -- a question that leans on "this/that/it" to mean "the thing we
+# were just talking about" is unanswerable without the prior question attached, regardless
+# of whether it happens to start with an interrogative word. Missed live 2026-08-13:
+# "what kind of tools we have to use for this" and "...walk me through the RCA approach"
+# (referring to a scenario stated two turns earlier) both slipped through the marker list
+# above and were answered with zero context -- one asked the interviewer to clarify (a
+# banned response), the other silently defaulted to the wrong toolset.
+_ANAPHORA_MARKERS = (
+    "for this", "for that", "with this", "with that", "in this case", "in that case",
+    "using this", "using that", "on this", "on that", "from this", "from that",
+    "this approach", "that approach", "this one", "that one", "this way",
+    "walk me through the", "walk me through this", "walk me through that",
+    "for the same", "the same time", "at the same time",
+)
+
+# An interviewer statement that is NOT a question and must never trigger an answer.
+_FRAGMENT_STARTERS = (
+    "and", "or", "but", "also", "plus", "with", "for", "from", "into", "across",
+    "specifically", "particularly", "especially", "including", "such", "like",
+    "the", "a", "an", "that", "this", "these", "those", "in", "on", "at", "to",
+)
+
+
+# Deterministic, code-level backstop for "asks the interviewer to clarify" -- proven live
+# 2026-08-13 that prompt instructions alone get rephrased around indefinitely (the model
+# swaps "I need you to restate" for "I don't have visibility into what this refers to" and
+# every variant in between). Detecting the BEHAVIOR via regex, rather than trusting the
+# model to police its own wording, is the only reliable fix.
+_CLARIFICATION_SEEKING_PATTERNS = (
+    r"\bi (?:can't|cannot|don't|do not) (?:answer|know|tell) (?:this|that|which)\b",
+    r"\bi (?:need|require) (?:more )?context\b",
+    r"\bi (?:need|require) you to (?:restate|clarify|specify|repeat)\b",
+    r"\b(?:could|can|would) you (?:restate|clarify|specify|repeat|rephrase)\b",
+    r"\bwhich (?:one|thing|topic) (?:are you|do you mean|were you)\b",
+    r"\bwithout (?:more|additional) (?:context|information|signal)\b",
+    r"\bi don'?t have visibility into\b",
+    r"\bi'?m not (?:sure|certain) (?:which|what) (?:you'?re|you are) (?:asking|referring)\b",
+    r"\bplease (?:clarify|specify|restate|elaborate on what)\b",
+    r"\bmy best guess\b.{0,40}\bif you\b",
+    r"\bare you asking about\b.{0,80}\bor\b.{0,80}\bor\b",  # the "A, B, or C?" menu pattern
+)
+_CLARIFICATION_RE = re.compile("|".join(_CLARIFICATION_SEEKING_PATTERNS), re.IGNORECASE)
+
+
+def seeks_clarification(answer_text: str) -> bool:
+    """True if the answer asks the interviewer to explain/restate the question.
+
+    Checked only in the first ~300 chars -- that is where this failure mode always shows
+    up (it is how the response opens), and searching the whole answer risks a false
+    positive from an unrelated later sentence that happens to contain "context" or similar.
+    """
+    return bool(_CLARIFICATION_RE.search(answer_text[:300]))
+
+
+_CLARIFICATION_RETRY_INSTRUCTION = (
+    "\n\nMANDATORY CORRECTION -- your previous attempt at this exact question asked the "
+    "interviewer to clarify, restate, or explain what was meant. That is not permitted, in "
+    "any wording, under any framing. You do not have the option of asking for more "
+    "information. Pick the single most defensible interpretation of the question given "
+    "your grounding and this interview's domain, and answer it directly and confidently, "
+    "starting from substance in the very first sentence. If you are genuinely uncertain, "
+    "mark the answer [Low Confidence] -- that is allowed. Asking the interviewer anything "
+    "is not."
+)
+
+
+def _materially_different(new_text: str, old_text: str, min_new_words: int = 3) -> bool:
+    """True only if the new text adds real content over the old.
+
+    Whisper re-emits near-duplicate text on echo/noise tails. Without this check each
+    duplicate triggers a full cancel+regenerate cycle, so the answer restarts forever and
+    never completes -- observed live 2026-08-13.
+    """
+    new_words = new_text.lower().split()
+    old_words = old_text.lower().split()
+    if len(new_words) <= len(old_words):
+        return False
+    added = new_words[len(old_words):]
+    # Ignore filler-only additions ("okay", "so", "and", "yeah")
+    meaningful = [w for w in added if w.strip(".,!?;:") not in
+                  {"okay", "ok", "so", "and", "the", "a", "yeah", "right", "um", "uh", "you"}]
+    return len(meaningful) >= min_new_words
+
+
+def _strip_leading_repeated_filler(text: str) -> str:
+    """Strip a short phrase immediately repeated at the start of text.
+
+    Whisper occasionally hallucinates a short filler repeat ('and the and the') that
+    survives the fragment-hold path and gets concatenated onto the next real segment,
+    polluting the front of the actual question -- observed live 2026-08-13 producing
+    q='and the You have 500 AWS accounts...'. Only strips units of 1-3 words repeated at
+    least twice, so genuine short emphatic speech elsewhere in a real sentence ('no no no,
+    that's not right') is untouched -- this only fires on a repeat sitting at the very
+    front of a held fragment.
+    """
+    words = text.strip().split()
+    for unit_len in (1, 2, 3):
+        if len(words) < unit_len * 2:
+            continue
+        unit = [w.lower().strip(".,!?") for w in words[:unit_len]]
+        pos = unit_len
+        repeats = 1
+        while pos + unit_len <= len(words):
+            candidate = [w.lower().strip(".,!?") for w in words[pos : pos + unit_len]]
+            if candidate != unit:
+                break
+            repeats += 1
+            pos += unit_len
+        if repeats >= 2:
+            return " ".join(words[pos:]).strip()
+    return text
+
+
+def _is_sentence_fragment(text: str) -> bool:
+    """True for a dangling continuation that is not answerable on its own.
+
+    Observed live: 'infrastructure telemetric.' and 'and the' were answered as standalone
+    questions because they happened to contain a detector keyword. A fragment like that
+    carries no question -- it belongs merged onto the utterance it continues.
+    """
+    cleaned = text.strip().strip(".,!?;: ")
+    if not cleaned:
+        return True
+    words = cleaned.split()
+    if "?" in text:
+        return False  # an explicit question mark is a strong standalone signal
+    if len(words) > 5:
+        return False
+    lowered = words[0].lower()
+    # Starts with a conjunction/preposition/article => it is continuing a previous clause.
+    if lowered in _FRAGMENT_STARTERS:
+        return True
+    # Very short with no interrogative opener at all => not an answerable question.
+    interrogatives = {"why", "how", "what", "when", "where", "which", "who", "explain",
+                      "describe", "tell", "give", "can", "could", "would", "do", "did",
+                      "have", "is", "are", "was"}
+    return len(words) <= 3 and lowered not in interrogatives
+
+
+_ACKNOWLEDGEMENT_ONLY = {
+    "ok", "okay", "right", "sure", "yes", "yeah", "yep", "mm", "mmhmm", "uh huh",
+    "makes sense", "interesting", "got it", "understood", "good", "great", "nice",
+    "thats good", "that's good", "fair enough", "go on", "continue", "i see",
+    "perfect", "excellent", "cool", "alright", "all right", "true", "exactly",
+    "thank you", "thanks", "thank you very much", "many thanks", "cheers",
+    "no worries", "not a problem", "sounds good", "sounds great", "noted",
+    "appreciate it", "appreciated", "gotcha", "for sure", "absolutely",
+}
+
+
+def _looks_like_new_question(text: str) -> bool:
+    lowered = text.lower().strip()
+    return any(lowered.startswith(opener) or opener in lowered[:40]
+               for opener in _NEW_QUESTION_OPENERS)
+
+
+def _is_question_enhancement(text: str) -> bool:
+    """True when this looks like added detail on the SAME question, not a new topic.
+
+    An explicit topic-change marker ("next question", "let's move on") is the reliable
+    negative signal; absent that, a short addition shortly after the previous question is
+    far more likely to be a qualifier than a brand-new question.
+    """
+    return not _looks_like_new_question(text)
+
+
+def _is_acknowledgement_only(text: str) -> bool:
+    """Interviewer noise ('Okay.', 'Right.', 'Makes sense.') that must not be answered."""
+    cleaned = text.lower().strip().strip(".!?,;: ")
+    if not cleaned:
+        return True
+    if cleaned in _ACKNOWLEDGEMENT_ONLY:
+        return True
+    # Also catch short combinations like "okay, right" / "yeah makes sense"
+    words = [w.strip(".!?,;:") for w in cleaned.split()]
+    if len(words) <= 4 and all(
+        w in {x for phrase in _ACKNOWLEDGEMENT_ONLY for x in phrase.split()} for w in words if w
+    ):
+        return True
+    return False
+
+
+def _is_followup(text: str) -> bool:
+    """True for a drill-down/challenge that needs the previous Q&A attached to make sense."""
+    lowered = text.lower().strip().strip(".!?")
+    if _looks_like_new_question(lowered):
+        return False
+    # Anaphoric references ("for this", "at the same time", "walk me through this") can
+    # land anywhere in the sentence, including the end -- check the WHOLE text, not just
+    # an opening window. A question leaning on "this/that" to mean "what we were just
+    # discussing" is unanswerable standalone regardless of where that reference sits.
+    if any(m in lowered for m in _ANAPHORA_MARKERS):
+        return True
+    word_count = len(lowered.split())
+    # Short questions are almost always drill-downs on what was just said.
+    if word_count <= 8:
+        return True
+    return any(lowered.startswith(m) or f" {m}" in lowered[:60] for m in _FOLLOWUP_MARKERS)
 
 
 class MeetingPipeline:
@@ -75,9 +335,37 @@ class MeetingPipeline:
         self._run_task: asyncio.Task | None = None
         self._worker_task: asyncio.Task | None = None
         self._segment_queue: asyncio.Queue[SpeechSegment] = asyncio.Queue()
+        self._pending_transcript: Transcript | None = None
+        self._last_answered: Transcript | None = None
+        # Rolling conversation memory: the last few (question, answer) pairs. Without this,
+        # every question is answered in isolation -- which is why bare follow-ups ("Why?",
+        # "What about 100k events/sec?", "Give me an example") were previously answered as
+        # if they were standalone questions with no idea what they referred to.
+        self._conversation: list[tuple[str, str]] = []
+        # In-flight generation, so new speech can cancel a stale answer mid-stream.
+        self._active_generation: asyncio.Task | None = None
+        # Monotonic generation id. Cancellation is not instantaneous -- a task can be between
+        # awaits when cancelled, or an in-flight HTTP response can land afterwards. Every
+        # overlay write is gated on "am I still the newest generation?", so a slow or
+        # cancelled answer can never overwrite a newer one.
+        self._generation_seq = 0
+        # Debounce timer: gives the interviewer a beat to keep talking before we commit.
+        self._debounce_task: asyncio.Task | None = None
+        # Accumulated non-question scenario-setup sentences, held rather than discarded so
+        # the eventual question carries the scenario instead of losing it. Separate from
+        # _pending_transcript because the gap between scenario sentences (10-18s observed)
+        # is much longer than _FRAGMENT_MERGE_GAP_SECONDS (3s), which is tuned for a single
+        # paused-and-continued utterance, not a multi-sentence scenario walkthrough.
+        self._scenario_context_text: str = ""
+        self._scenario_context_end_time: float = 0.0
 
     async def _handle_segment(self, segment: SpeechSegment) -> None:
-        started_at = time.monotonic()
+        """Turn a speech segment into pending question text, then (re)start the debounce.
+
+        Deliberately does NOT answer directly -- it hands off to a debounce timer so that
+        an interviewer who keeps talking (a pause mid-question, or an added qualifier)
+        updates the same pending question instead of triggering a second answer.
+        """
         try:
             with StageTimer("speaker_id"):
                 diarized = await asyncio.to_thread(self._diarizer.diarize, segment)
@@ -89,15 +377,241 @@ class MeetingPipeline:
             if transcript is None:
                 return
 
-            question = self._question_detector.detect(transcript)
-            if question is None:
-                logger.debug(f"Not a question, skipping: {transcript.text!r}")
+            # DO NOT cancel yet. Measured live 2026-08-13: cancelling on every incoming
+            # segment meant sub-second noise blips (864ms, 896ms) each killed the in-flight
+            # answer and restarted it -- the same question regenerated 4+ times and the
+            # candidate never saw a completed answer. Cancel only once we know this segment
+            # actually changes the question (below).
+            if _is_acknowledgement_only(transcript.text):
+                logger.debug(f"Acknowledgement mid-answer, ignoring: {transcript.text!r}")
                 return
+
+            pending = self._pending_transcript
+            # NOTE: deliberately NOT comparing speaker_id. Measured live 2026-08-13: with no
+            # enrolled voice, pyannote assigns a NEW speaker id to nearly every segment
+            # (A,B,C,D,E,F within one minute), so any speaker-equality check silently never
+            # fires and fragments stop merging. We only capture the far end via BlackHole --
+            # the candidate's own mic is never in this stream -- so effectively every segment
+            # is the interviewer and speaker matching buys nothing while breaking merging.
+            if (
+                pending is not None
+                and (transcript.start_time - pending.end_time) < _FRAGMENT_MERGE_GAP_SECONDS
+            ):
+                # Same speaker, short gap -- continuation of the same utterance. Strip a
+                # leading repeated-filler artifact from the held fragment first so it
+                # doesn't pollute the front of the merged text.
+                cleaned_pending_text = _strip_leading_repeated_filler(pending.text)
+                pending.text = f"{cleaned_pending_text} {transcript.text}".strip()
+                pending.end_time = transcript.end_time
+            elif (
+                pending is None
+                and self._last_answered is not None
+                and (transcript.start_time - self._last_answered.end_time)
+                < _SUPERSEDE_WINDOW_SECONDS
+                and _is_question_enhancement(transcript.text)
+                and not self._reads_as_independent_question(transcript)
+            ):
+                # ENHANCEMENT / SUPERSEDE: we already answered, then the same speaker added
+                # detail to the SAME question -- "how would you design event correlation?"
+                # [pause] "specifically across Splunk and Prometheus in a bank". Answering
+                # the addition alone loses the original question, so re-answer the COMBINED
+                # question and replace the previous answer on the overlay.
+                merged_text = f"{self._last_answered.text} {transcript.text}".strip()
+                # Guard against re-answering the same thing forever. Whisper re-emits
+                # near-identical text for echo/noise tails, and without this the merged
+                # question barely changes yet still triggers a full cancel+regenerate --
+                # observed live as the same answer restarting 4 times in 20 seconds.
+                if not _materially_different(merged_text, self._last_answered.text):
+                    logger.info(
+                        f"Enhancement adds nothing new, keeping current answer: "
+                        f"{transcript.text[:60]!r}"
+                    )
+                    return
+                logger.info(f"ENHANCEMENT detected -- merged question: {merged_text!r}")
+                pending = Transcript(
+                    speaker_id=transcript.speaker_id,
+                    text=merged_text,
+                    start_time=self._last_answered.start_time,
+                    end_time=transcript.end_time,
+                    language=transcript.language,
+                )
+            else:
+                # Genuinely new utterance. Whatever was pending never got answered, so it
+                # was almost certainly an incomplete fragment -- fold it in rather than
+                # dropping it silently. Strip a leading repeated-filler artifact first (see
+                # _strip_leading_repeated_filler).
+                if pending is not None:
+                    cleaned_pending_text = _strip_leading_repeated_filler(pending.text)
+                    transcript.text = f"{cleaned_pending_text} {transcript.text}".strip()
+                    transcript.start_time = pending.start_time
+                pending = transcript
+
+            # Only NOW is it worth interrupting: this segment genuinely changes the question.
+            self._cancel_active_generation("question changed")
+            if self._debounce_task and not self._debounce_task.done():
+                self._debounce_task.cancel()
+
+            self._pending_transcript = pending
+            self._debounce_task = asyncio.create_task(self._debounced_process())
+        except Exception:
+            logger.exception("Error handling speech segment")
+
+    def _reads_as_independent_question(self, transcript: Transcript) -> bool:
+        """True if this segment has its own complete interrogative signal -- a "?" or an
+        opener like "have you"/"can I"/"how would you" -- meaning it is very likely a
+        genuinely NEW question, not a qualifier being added to the previous one.
+
+        Observed live 2026-08-13, twice in one session: "Tell me about yourself" was
+        answered, then "Have you designed any kind of agent-KI automation?" (and later
+        "Can I explain the Agentic AI solution...") arrived inside the 15s supersede
+        window and got merged into the FIRST question's text, because
+        _is_question_enhancement only refuses to merge when the new segment uses an
+        explicit transition phrase ("next question", "moving on") -- real interviewers
+        almost never say those, they just ask the next question directly. Checking the
+        segment's own interrogative strength catches this regardless of phrasing.
+        """
+        detected = self._question_detector.detect(transcript)
+        return detected is not None and detected.has_interrogative_signal
+
+    def _cancel_active_generation(self, reason: str) -> None:
+        if self._active_generation and not self._active_generation.done():
+            self._active_generation.cancel()
+            logger.info(f"Cancelled in-flight answer generation: {reason}")
+
+    async def _debounced_process(self) -> None:
+        """Wait a beat before committing to an answer.
+
+        This is the guard against answering half a question: if the interviewer is simply
+        pausing mid-sentence, the next segment arrives inside this window, cancels this
+        timer, and extends the pending question instead of producing a second answer.
+        """
+        try:
+            await asyncio.sleep(_QUESTION_DEBOUNCE_SECONDS)
+        except asyncio.CancelledError:
+            return
+
+        transcript = self._pending_transcript
+        if transcript is None:
+            return
+        self._pending_transcript = None
+        self._generation_seq += 1
+        gen_id = self._generation_seq
+        self._active_generation = asyncio.create_task(
+            self._process_transcript(transcript, gen_id)
+        )
+        try:
+            await self._active_generation
+        except asyncio.CancelledError:
+            logger.debug("Answer generation cancelled before completion")
+
+    async def _process_transcript(self, transcript: Transcript, gen_id: int = 0) -> None:
+        started_at = time.monotonic()
+
+        def is_current() -> bool:
+            """False once a newer question has superseded this generation."""
+            return gen_id == 0 or gen_id == self._generation_seq
+
+        try:
+            # Interviewer acknowledgements ("Okay." / "Right." / "Makes sense.") are not
+            # questions and must never trigger an answer -- they'd wipe a useful answer off
+            # the overlay mid-read.
+            if _is_acknowledgement_only(transcript.text):
+                logger.debug(f"Acknowledgement, not answering: {transcript.text!r}")
+                return
+
+            # A dangling continuation ("infrastructure telemetric.", "and the") is not an
+            # answerable question -- answering it wipes a good answer off the overlay and
+            # replaces it with nonsense. Hold it as pending so the NEXT segment merges with
+            # it, rather than burning a generation on it.
+            if _is_sentence_fragment(transcript.text):
+                logger.info(f"Fragment held for merge, not answered: {transcript.text!r}")
+                self._pending_transcript = transcript
+                return
+
+            question = self._question_detector.detect(transcript)
+            mid_scenario_buildup = bool(self._scenario_context_text) and (
+                transcript.start_time - self._scenario_context_end_time
+            ) < _SCENARIO_CONTEXT_WINDOW_SECONDS
+            # A detection with no real interrogative signal (no "?", no interrogative
+            # opener -- it only survived on a keyword match or technical-term density)
+            # arriving WHILE a scenario is already being built up is far more likely to be
+            # another scenario sentence than the interviewer's actual ask -- observed live
+            # 2026-08-13: "production BigPanda application suddenly produces false alarms"
+            # matched the keyword "bigpanda" and got answered immediately, truncating the
+            # scenario buildup before the real question ("how would you determine...")
+            # arrived. A real ask overwhelmingly uses an interrogative phrasing, so treat
+            # this as more scenario instead. When there's NO active buildup, this stays
+            # exactly as before: catching a real STANDALONE question that has a keyword or
+            # technical density but happened to lose its interrogative wording to STT.
+            if question is None or (
+                not question.has_interrogative_signal and mid_scenario_buildup
+            ):
+                # Not phrased as a question, but a real declarative sentence is almost
+                # always scenario setup ("the two services show anomalies with no direct
+                # dependency") that the interviewer will assume as given once the actual
+                # question lands. Hold it instead of discarding it -- see
+                # _SCENARIO_CONTEXT_WINDOW_SECONDS.
+                if mid_scenario_buildup:
+                    self._scenario_context_text = (
+                        f"{self._scenario_context_text} {transcript.text}".strip()
+                    )
+                else:
+                    self._scenario_context_text = transcript.text
+                self._scenario_context_end_time = transcript.end_time
+                logger.info(f"Held as scenario context, not answered: {transcript.text!r}")
+                return
+
+            # If scenario-setup sentences were held recently, this question almost
+            # certainly depends on them -- prepend them so the LLM sees the full scenario,
+            # not just the trailing question. Consume-and-clear: this scenario belongs to
+            # THIS question only, not future ones.
+            have_scenario_context = bool(self._scenario_context_text) and (
+                question.transcript.start_time - self._scenario_context_end_time
+            ) < _SCENARIO_CONTEXT_WINDOW_SECONDS
+            if have_scenario_context:
+                logger.info(
+                    f"Prepending held scenario context: {self._scenario_context_text!r}"
+                )
+                question.transcript.text = (
+                    f"{self._scenario_context_text} {question.transcript.text}".strip()
+                )
+            self._scenario_context_text = ""
+            self._scenario_context_end_time = 0.0
+
+            # A bare drill-down ("Why not Kinesis?", "At scale?", "Give me an example")
+            # is meaningless standalone. Attach the running conversation so the answer
+            # defends the decision just made instead of restarting from first principles.
+            # Skipped when scenario context was just attached -- that scenario IS the
+            # context, so pulling in an unrelated earlier Q&A on top would be wrong (this
+            # is exactly how the wrong-context bug reproduced live 2026-08-13: a "How would
+            # you..." scenario question got misread as a follow-up to a DIFFERENT, already-
+            # answered question because "how" is a generic follow-up marker).
+            conversation_context = ""
+            if not have_scenario_context and _is_followup(transcript.text) and self._conversation:
+                prev_q, prev_a = self._conversation[-1]
+                conversation_context = (
+                    "\n\nCONVERSATION SO FAR -- the interviewer is drilling into the answer "
+                    "you just gave, not asking a fresh question. Treat this as ONE continuing "
+                    "architectural discussion: defend, refine or honestly revise the position "
+                    "you already took rather than restarting the explanation from scratch. "
+                    "Keep it SHORT and precise -- a drill-down deserves a tight, direct answer, "
+                    "not a re-lecture.\n"
+                    f"  PREVIOUS QUESTION: {prev_q}\n"
+                    f"  YOUR PREVIOUS ANSWER (abridged): {prev_a[:1200]}\n"
+                    "  NOTE: your own previous answer is NOT evidence of your real experience. "
+                    "If it claimed hands-on experience you do not actually have per the persona "
+                    "grounding, correct that now rather than building on it.\n"
+                )
+                logger.info(f"FOLLOW-UP detected, attaching prior context: {transcript.text!r}")
+
+            # Remember what we answered so a later addition from the same speaker can be
+            # merged with it and re-answered, instead of being answered context-free.
+            self._last_answered = transcript
 
             # Flip the overlay to "answering..." with the heard question right away --
             # visible feedback within ~a second of speech ending, well before the
             # retrieval+LLM answer starts streaming in over it.
-            if self._on_partial_answer:
+            if self._on_partial_answer and is_current():
                 await self._on_partial_answer(f"*Q: {question.transcript.text}*")
 
             # Pre-generated Q&A bank: a close-enough banked question serves its stored
@@ -117,7 +631,7 @@ class MeetingPipeline:
                         RetrievedContext(question=question, chunks=[]), banked.answer
                     )
                     PIPELINE_TOTAL_LATENCY_SECONDS.observe(time.monotonic() - started_at)
-                    if self._on_answer:
+                    if self._on_answer and is_current():
                         await self._on_answer(answer)
                     return
 
@@ -128,28 +642,83 @@ class MeetingPipeline:
                 context = RetrievedContext(question=question, chunks=[])
 
             chunk_texts = [c.text for c in context.chunks]
-            cached_text = await self._cache.get_llm_response(question.transcript.text, chunk_texts)
+            # Follow-ups depend on prior context, so they must never serve a cached answer
+            # keyed only on their own (short, ambiguous) text -- "Why?" would collide across
+            # completely unrelated discussions.
+            cached_text = (
+                None
+                if conversation_context
+                else await self._cache.get_llm_response(question.transcript.text, chunk_texts)
+            )
+            system_prompt = (
+                build_system_prompt(question_text=question.transcript.text)
+                + conversation_context
+            )
+            q_prefix = f"**Q:** {question.transcript.text}\n\n---\n\n"
             if cached_text is not None:
                 raw_text = cached_text
             else:
                 raw_text = ""
                 with StageTimer("llm"):
-                    system_prompt = build_system_prompt(question_text=question.transcript.text)
+                    first_token_at: float | None = None
                     async for delta in self._claude.stream(
                         build_user_prompt(context), system=system_prompt
                     ):
                         raw_text += delta
+                        if first_token_at is None:
+                            first_token_at = time.monotonic()
+                            # TIME TO FIRST USEFUL ANSWER -- the metric that actually decides
+                            # whether this is usable live. Everything before this point is
+                            # dead air the candidate is standing in.
+                            logger.info(
+                                f"TTFA {first_token_at - started_at:.2f}s "
+                                f"(debounce {_QUESTION_DEBOUNCE_SECONDS}s excluded) "
+                                f"q={question.transcript.text!r}"
+                            )
+                        if not is_current():
+                            logger.debug("Stale generation -- dropping partial")
+                            return
                         if self._on_partial_answer:
-                            await self._on_partial_answer(raw_text)
-                await self._cache.set_llm_response(question.transcript.text, chunk_texts, raw_text)
+                            await self._on_partial_answer(q_prefix + raw_text)
+                if not conversation_context:
+                    await self._cache.set_llm_response(
+                        question.transcript.text, chunk_texts, raw_text
+                    )
+
+            # DETERMINISTIC BACKSTOP: prompt instructions alone proved unreliable at
+            # stopping the model from asking the interviewer to clarify -- it just
+            # rephrases around whatever banned strings are listed. Detect the behavior via
+            # regex and force one non-streamed regeneration with an amplified instruction
+            # rather than ever showing a clarification request on the overlay.
+            if seeks_clarification(raw_text) and is_current():
+                logger.warning(
+                    f"Answer sought clarification, forcing retry: {raw_text[:100]!r}"
+                )
+                retry_system = system_prompt + _CLARIFICATION_RETRY_INSTRUCTION
+                try:
+                    raw_text = await self._claude.complete(
+                        build_user_prompt(context), system=retry_system
+                    )
+                except Exception:
+                    logger.exception("Clarification-retry generation failed")
+                if is_current() and self._on_partial_answer:
+                    await self._on_partial_answer(q_prefix + raw_text)
 
             answer = self._optimizer.optimize(context, raw_text)
             PIPELINE_TOTAL_LATENCY_SECONDS.observe(time.monotonic() - started_at)
 
-            if self._on_answer:
+            # Record the exchange so the NEXT drill-down has something to build on.
+            self._conversation.append((question.transcript.text, answer.text))
+            if len(self._conversation) > _CONVERSATION_MEMORY_TURNS:
+                self._conversation.pop(0)
+
+            if self._on_answer and is_current():
                 await self._on_answer(answer)
+        except asyncio.CancelledError:
+            logger.debug("Generation cancelled mid-answer (interviewer spoke)")
+            raise
         except Exception:
-            logger.exception("Error handling speech segment")
+            logger.exception("Error processing transcript")
 
     async def _consume_queue(self) -> None:
         """Single worker: handles exactly one segment at a time, strictly in spoken order,

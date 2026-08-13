@@ -58,7 +58,26 @@ class MlxWhisperEngine:
                 "resample before calling transcribe_samples."
             )
         result = self._mlx_whisper.transcribe(
-            samples, path_or_hf_repo=self._repo, language=self._cfg.language
+            samples,
+            path_or_hf_repo=self._repo,
+            language=self._cfg.language,
+            initial_prompt=self._cfg.vocabulary_hint,
+            # condition_on_previous_text=False is the single most important accuracy setting
+            # here. With it True (the default), each window is conditioned on the previously
+            # decoded text -- so one garbled decode cascades, producing the runaway repetition
+            # loops seen live ("Disability Disability Disability...", "create create create...").
+            # Disabling it costs a little cross-window coherence but stops the cascade entirely.
+            condition_on_previous_text=False,
+            # Greedy decode: deterministic, and avoids the temperature-fallback ladder
+            # (0.0->1.0) that produces increasingly invented text on hard audio.
+            temperature=0.0,
+            # Reject a window whose gzip compression ratio implies heavy repetition. Default
+            # 2.4 is lenient; 2.0 catches repetition loops earlier.
+            compression_ratio_threshold=2.0,
+            # Explicitly drop segments Whisper decodes over near-silence -- the other main
+            # hallucination source ("Thank you." over an empty channel).
+            hallucination_silence_threshold=2.0,
+            no_speech_threshold=0.6,
         )
         text = result.get("text", "")
         return text.strip() if isinstance(text, str) else ""
