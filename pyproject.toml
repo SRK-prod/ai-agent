@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "meeting-copilot"
 version = "0.1.0"
-description = "macOS desktop agent that listens to meeting audio, ignores the user's own voice, and surfaces Claude-generated answers to technical questions asked by other participants."
+description = "Desktop agent (macOS and Windows) that listens to meeting audio, ignores the user's own voice, and surfaces Claude-generated answers to technical questions asked by other participants."
 requires-python = ">=3.13"
 readme = "README.md"
 

@@ -1,16 +1,18 @@
 # meeting-copilot
 
-A macOS desktop agent that listens continuously to meeting audio, learns and
-ignores your own voice, transcribes everyone else, detects when someone asks a
-technical question, retrieves relevant context from a pre-built knowledge base,
-and shows a concise Claude-generated answer in a floating always-on-top overlay.
-No manual interaction is required once the meeting starts.
+A desktop agent (macOS and Windows) that listens continuously to meeting
+audio, learns and ignores your own voice, transcribes everyone else, detects
+when someone asks a technical question, retrieves relevant context from a
+pre-built knowledge base, and shows a concise Claude-generated answer in a
+floating always-on-top overlay. No manual interaction is required once the
+meeting starts.
 
 See [`docs/architecture.md`](docs/architecture.md) for how the pipeline fits
-together, and [`docs/installation.md`](docs/installation.md) for full setup
-(system audio routing, models, credentials).
+together, [`docs/installation.md`](docs/installation.md) for full macOS setup,
+and [`docs/installation-windows.md`](docs/installation-windows.md) for
+Windows (system audio routing, models, credentials).
 
-## Quickstart
+## Quickstart (macOS)
 
 ```bash
 # 1. System prerequisites (see docs/installation.md for details)
@@ -33,6 +35,15 @@ make ingest
 
 # 7. Run
 make run
+```
+
+## Quickstart (Windows)
+
+See [`docs/installation-windows.md`](docs/installation-windows.md) for the
+full walkthrough (VB-Audio Virtual Cable setup, venv, hotkeys). Once set up:
+
+```powershell
+scripts\start.ps1
 ```
 
 ## LLM backend

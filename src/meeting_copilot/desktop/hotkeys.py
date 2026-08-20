@@ -9,6 +9,8 @@ onto the Qt main thread automatically) rather than touching widgets directly.
 
 from __future__ import annotations
 
+import sys
+
 from pynput import keyboard
 from PySide6.QtCore import QObject, Signal
 
@@ -45,12 +47,25 @@ class HotkeyManager:
         )
 
     def start(self) -> None:
+        self._warn_if_cmd_on_non_macos()
         self._listener.start()
         logger.info(
             "Global hotkeys active: "
             f"hide={self._cfg.hotkeys.hide} pin={self._cfg.hotkeys.pin} "
             f"expand={self._cfg.hotkeys.expand} copy={self._cfg.hotkeys.copy_answer}"
         )
+
+    def _warn_if_cmd_on_non_macos(self) -> None:
+        if sys.platform == "darwin":
+            return
+        hotkeys = self._cfg.hotkeys
+        if any("<cmd>" in hk for hk in (hotkeys.hide, hotkeys.pin, hotkeys.expand, hotkeys.copy_answer)):
+            logger.warning(
+                "Configured hotkeys use <cmd>, which maps to the Windows key on this "
+                "platform -- Win+Shift+* combos are OS-reserved and often won't register "
+                "reliably. Consider <ctrl>+<alt>+... instead in configs/settings.yaml "
+                "(see docs/installation-windows.md)."
+            )
 
     def stop(self) -> None:
         self._listener.stop()

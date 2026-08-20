@@ -1,10 +1,13 @@
-"""Live audio capture via CoreAudio (through PortAudio/sounddevice).
+"""Live audio capture via PortAudio/sounddevice (cross-platform: CoreAudio on
+macOS, WASAPI/DirectSound on Windows).
 
-Expects the input device to be a BlackHole-backed Multi-Output Device (or
-Loopback) so both the meeting app's output and the user's mic are present in
-one stream -- see docs/installation.md for the macOS Audio MIDI Setup steps.
-That device routing is a manual, one-time system change; this module just
-captures whatever device is configured.
+Expects the input device to be a virtual-audio-driver-backed device (or
+Multi-Output/Loopback) so both the meeting app's output and the user's mic
+are present in one stream -- see docs/installation.md for the macOS Audio
+MIDI Setup steps (BlackHole) or docs/installation-windows.md for the Windows
+equivalent (VB-Audio Virtual Cable / VoiceMeeter). That device routing is a
+manual, one-time system change; this module just captures whatever device is
+configured in `audio.input_device` by name.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ logger = get_logger()
 
 
 def list_input_devices() -> list[dict]:
-    """Enumerate CoreAudio input-capable devices, for picking `audio.input_device`."""
+    """Enumerate PortAudio input-capable devices, for picking `audio.input_device`."""
     devices = sd.query_devices()
     return [
         {"index": i, "name": d["name"], "max_input_channels": d["max_input_channels"]}
@@ -34,7 +37,7 @@ def list_input_devices() -> list[dict]:
 
 
 def resolve_device(name: str | None) -> int | None:
-    """Look up a CoreAudio input device index by (partial, case-insensitive) name."""
+    """Look up a PortAudio input device index by (partial, case-insensitive) name."""
     if not name:
         return None
     for d in list_input_devices():
