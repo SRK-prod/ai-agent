@@ -868,16 +868,24 @@ class MeetingPipeline:
 
         Separate from the VAD/STT pipeline on purpose: those only run when speech is
         detected, so they have no way to notice "nothing is coming through at all" -- a
-        dead/silent audio stream looks identical to an interviewer who just hasn't spoken.
-        Observability only for now, no automatic recovery -- see AudioHealth / _CALLBACK_
-        STALL_SECONDS etc. in audio/capture.py for the reasoning behind the thresholds.
+        dead capture pipeline looks identical, downstream, to an interviewer who just isn't
+        talking right now. Observability only for now, no automatic recovery -- see the
+        module docstring in audio/capture.py for why AUDIO_INPUT_LOST is driven only by
+        infrastructure evidence (callback/device), never by how long the signal is quiet.
+
+        AUDIO_INPUT_LOST is a real problem (logged at warning); AUDIO_ACTIVE<->AUDIO_SILENT
+        is routine conversational silence (logged at info, not warning) -- the interviewer
+        going silent while the candidate answers is expected and will transition through
+        here on essentially every question, so treating it as a warning would bury the
+        signal that actually matters in noise.
         """
         last_state: str | None = None
         while self._running:
             try:
                 health = self._capture.health()
                 if health.state != last_state:
-                    logger.warning(
+                    log = logger.warning if health.state == "AUDIO_INPUT_LOST" else logger.info
+                    log(
                         f"Audio health: {last_state} -> {health.state}"
                         + (f" reason={health.reason}" if health.reason else "")
                         + f" (peak={health.last_peak:.4f} rms={health.last_rms:.4f} "

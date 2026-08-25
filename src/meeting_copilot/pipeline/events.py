@@ -94,19 +94,25 @@ class Answer:
 
 @dataclass
 class AudioHealth:
-    """Point-in-time read of whether the audio capture stream is actually delivering usable
-    signal -- see audio/capture.py AudioCapture.health(). Distinguishes "the interviewer
-    is quiet" from "the pipeline stopped hearing them", which look identical downstream
-    (no transcripts) but need very different responses.
+    """Point-in-time read of whether the audio CAPTURE INFRASTRUCTURE is actually working --
+    see audio/capture.py AudioCapture.health(). Answers "can this still hear the
+    interviewer if they speak", not "has the interviewer spoken recently" -- this capture
+    stream carries only the interviewer's side (BlackHole/system audio), so it is silent for
+    the entire time the candidate is answering (routinely 30s-several minutes), which is
+    normal and must never by itself read as a failure. Confirmed live 2026-08-25: an
+    earlier version that escalated on silence DURATION produced 7 false AUDIO_INPUT_LOST
+    warnings in one ~11-minute session, every one recovering the instant the interviewer
+    spoke again.
     """
 
     state: str  # "AUDIO_ACTIVE" | "AUDIO_SILENT" | "AUDIO_INPUT_LOST"
-    # Only set when state != AUDIO_ACTIVE. "CALLBACK_STALLED" (the capture callback itself
-    # stopped firing -- device/stream problem) vs "ZERO_SIGNAL" (callbacks are arriving but
-    # every buffer is silent -- could be a routing problem, e.g. the Multi-Output/Aggregate
-    # device losing the actual source). Not shown in the overlay, logged on every state
-    # transition -- this is exactly the detail that was missing to diagnose past live
-    # dropouts after the fact.
+    # AUDIO_ACTIVE: None. AUDIO_SILENT: "NO_INTERVIEWER_SPEECH" -- informational, not an
+    # error; can legitimately last minutes. AUDIO_INPUT_LOST: "CALLBACK_STALLED" (the
+    # capture callback itself stopped firing) | "DEVICE_UNAVAILABLE" (the configured input
+    # device is gone) | "DEVICE_CHANGED" (that device index now belongs to a different
+    # device -- CoreAudio renumbering, e.g. after a Bluetooth device connects). Not shown in
+    # the overlay, logged on every state transition -- this is exactly the detail that was
+    # missing to diagnose past live dropouts after the fact.
     reason: str | None
     seconds_since_signal: float
     seconds_since_callback: float

@@ -19,13 +19,17 @@ _PANEL_COLOR = QColor(20, 20, 24, 235)
 _PANEL_RADIUS = 12.0
 
 # Small, unobtrusive inline indicator -- normal operation, never meant to draw the eye.
+# AUDIO_SILENT is deliberately NEUTRAL (white/gray, not a caution color) -- it means "the
+# interviewer isn't talking right now" (routinely true for the entire time the candidate is
+# answering), not "something might be wrong". A yellow/amber tone here would still read as
+# a low-grade warning, which is exactly the false-alarm impression this is meant to avoid.
 _AUDIO_STATUS_STYLE = {
     "AUDIO_ACTIVE": ("color: #6fcf6f; font-size: 11px;", "\U0001f7e2 Audio"),
-    "AUDIO_SILENT": ("color: #e0c34c; font-size: 11px;", "\U0001f7e1 Audio quiet"),
+    "AUDIO_SILENT": ("color: #aaaaaa; font-size: 11px;", "\U000026aa Listening"),
 }
-# Deliberately the opposite -- AUDIO_INPUT_LOST means the pipeline stopped hearing the
-# interviewer entirely, which needs action, not a quiet color change.
-_AUDIO_LOST_TEXT = "\U0001f534 AUDIO INPUT LOST\nCheck microphone/audio\nRestart capture if needed"
+# Deliberately the opposite -- AUDIO_INPUT_LOST means the CAPTURE PIPELINE itself stopped
+# working (not "the interviewer is quiet"), which needs action.
+_AUDIO_LOST_TEXT = "\U0001f534 AUDIO INPUT LOST\nCheck audio capture"
 _AUDIO_LOST_STYLE = (
     "background-color: rgba(180, 40, 40, 0.92); color: white; font-weight: bold; "
     "font-size: 12px; padding: 8px 12px; border-radius: 6px; border: 1px solid #ff6b6b;"

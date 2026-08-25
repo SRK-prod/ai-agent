@@ -22,19 +22,36 @@ from meeting_copilot.utils.logging import get_logger
 
 logger = get_logger()
 
-# Audio health thresholds (see AudioCapture.health()) -- observability only, no automatic
-# recovery yet. Deliberately plain module constants, matching every other tunable timing
-# value in this codebase (e.g. orchestrator.py's debounce/revision-window constants):
-# edit the number, restart. These starting points are from the spec, not measured yet --
-# tune them once real interview sessions produce a few actual dropout occurrences.
+# Audio health (see AudioCapture.health()) -- observability only, no automatic recovery yet.
+#
+# CRITICAL DESIGN FACT, learned from real interview telemetry 2026-08-25: this capture
+# stream carries ONLY the interviewer's side (BlackHole/system audio), never the
+# candidate's own mic. While the candidate is answering -- routinely 30s to several
+# minutes -- this stream is 100% silent by design. That is normal conversation, not a
+# failure, so DURATION OF ZERO SIGNAL MUST NEVER BY ITSELF ESCALATE TO A FAILURE STATE.
+# An earlier version of this watchdog did exactly that (zero signal for 20s -> "input
+# lost") and produced a false red warning on nearly every candidate answer -- confirmed
+# live: 7 false "AUDIO_INPUT_LOST" transitions in one ~11-minute session, every single one
+# recovering on its own the moment the interviewer spoke again. Silence is not failure.
+#
+# So AUDIO_INPUT_LOST is now driven ONLY by evidence the CAPTURE INFRASTRUCTURE itself is
+# broken -- the callback stopped firing, or the expected device disappeared/changed --
+# never by how long the signal has been quiet. AUDIO_ACTIVE vs AUDIO_SILENT is purely
+# "is there signal right now", informational either way.
 _SIGNAL_PEAK_THRESHOLD = 0.0005  # a buffer at or below this peak counts as "silent"
-_AUDIO_SILENT_AFTER_SECONDS = 10.0  # 0-10s of continuous silence is normal (pauses, etc.)
-_AUDIO_LOST_AFTER_SECONDS = 20.0  # 10-20s -> AUDIO_SILENT, 20s+ -> AUDIO_INPUT_LOST
-# If the callback itself hasn't fired in this long, the stream/device has stopped
-# delivering buffers at all -- a different failure (CALLBACK_STALLED) from "callbacks are
-# arriving but every buffer is silent" (ZERO_SIGNAL). Kept short: at block_ms=30 a healthy
-# stream calls back roughly every 30ms, so several seconds of total silence from the
-# callback itself is already a clear stall, not scheduler jitter.
+
+# Pure UI smoothing between AUDIO_ACTIVE and AUDIO_SILENT -- NOT a failure threshold, and
+# never escalates to AUDIO_INPUT_LOST. Without this, the indicator would flicker
+# active/silent on every ~100-300ms gap between words in the interviewer's own normal
+# speech. Kept short and deliberately far below any duration that could be mistaken for a
+# failure signal.
+_RECENT_SIGNAL_WINDOW_SECONDS = 1.5
+
+# If the callback itself hasn't fired in this long, the stream has stopped delivering
+# buffers entirely -- this, not silence, is the primary infrastructure-failure signal.
+# Kept short: at block_ms=30 a healthy stream calls back roughly every 30ms, so several
+# seconds of total callback silence is already a clear stall, not scheduler jitter, and is
+# completely independent of whether the interviewer is currently talking.
 _CALLBACK_STALL_SECONDS = 5.0
 
 
@@ -68,6 +85,11 @@ class AudioCapture:
     def __init__(self, config: AudioConfig | None = None):
         self._config = config or get_config().audio
         self._device = _resolve_device(self._config.input_device)
+        # The configured (partial, case-insensitive) name pattern -- kept so health() can
+        # later re-check that the device now sitting at self._device's index is still the
+        # SAME physical device, not one the OS silently reassigned that index to (e.g. after
+        # a Bluetooth device connects/disconnects and CoreAudio renumbers everything).
+        self._expected_device_name = self._config.input_device
         self._blocksize = max(1, int(self._config.sample_rate * self._config.block_ms / 1000))
         self._queue: asyncio.Queue[AudioFrame] = asyncio.Queue(maxsize=200)
         self._stream: sd.InputStream | None = None
@@ -111,23 +133,55 @@ class AudioCapture:
         except asyncio.QueueFull:
             logger.warning("Audio queue full, dropping frame (consumer too slow)")
 
+    def _check_device(self) -> str | None:
+        """None if the expected input device is still present and unchanged; otherwise
+        "DEVICE_UNAVAILABLE" (gone, or no longer has input channels) or "DEVICE_CHANGED"
+        (the index we opened now belongs to a different-named device -- CoreAudio can
+        renumber devices when one connects/disconnects, e.g. Bluetooth or an Aggregate/
+        Multi-Output device changing). Enumerates devices fresh each call -- cheap metadata,
+        deliberately kept off the realtime audio callback and only called from the async
+        watchdog poll (every few seconds), never from the audio thread.
+        """
+        if self._device is None:
+            return None  # no specific device was configured -- nothing to compare against
+        try:
+            devices = sd.query_devices()
+        except Exception:
+            # A transient enumeration hiccup shouldn't itself masquerade as a device
+            # failure -- the callback-liveness check above is the reliable signal for that.
+            return None
+        if self._device >= len(devices) or devices[self._device]["max_input_channels"] <= 0:
+            return "DEVICE_UNAVAILABLE"
+        current_name = devices[self._device]["name"]
+        if self._expected_device_name and self._expected_device_name.lower() not in current_name.lower():
+            return "DEVICE_CHANGED"
+        return None
+
     def health(self) -> AudioHealth:
-        """Point-in-time read of whether the stream is actually delivering usable signal --
+        """Point-in-time read of whether the CAPTURE INFRASTRUCTURE is actually working --
         does NOT block or touch the stream itself, safe to poll from a separate watchdog
-        loop on a timer. See AudioHealth for what each field means and _AUDIO_*_SECONDS
-        above for the thresholds.
+        loop on a timer.
+
+        Deliberately answers "can this still hear the interviewer if they speak", not "has
+        the interviewer spoken recently" -- see the module docstring above for why those are
+        different questions and why conflating them produced false alarms. AUDIO_INPUT_LOST
+        requires actual evidence the pipeline is broken (callback stalled, device gone/
+        changed); AUDIO_ACTIVE vs AUDIO_SILENT is purely "is there signal right now" and
+        never escalates on its own no matter how long the silence lasts.
         """
         now = time.monotonic()
         since_callback = now - self._last_callback_at
         since_signal = now - self._last_nonzero_signal_at
         if since_callback > _CALLBACK_STALL_SECONDS:
             state, reason = "AUDIO_INPUT_LOST", "CALLBACK_STALLED"
-        elif since_signal >= _AUDIO_LOST_AFTER_SECONDS:
-            state, reason = "AUDIO_INPUT_LOST", "ZERO_SIGNAL"
-        elif since_signal >= _AUDIO_SILENT_AFTER_SECONDS:
-            state, reason = "AUDIO_SILENT", "ZERO_SIGNAL"
         else:
-            state, reason = "AUDIO_ACTIVE", None
+            device_reason = self._check_device()
+            if device_reason is not None:
+                state, reason = "AUDIO_INPUT_LOST", device_reason
+            elif since_signal <= _RECENT_SIGNAL_WINDOW_SECONDS:
+                state, reason = "AUDIO_ACTIVE", None
+            else:
+                state, reason = "AUDIO_SILENT", "NO_INTERVIEWER_SPEECH"
         return AudioHealth(
             state=state,
             reason=reason,
