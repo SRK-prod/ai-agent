@@ -28,7 +28,13 @@ from meeting_copilot.llm.answer_optimizer import AnswerOptimizer
 from meeting_copilot.llm.claude_client import ClaudeClient
 from meeting_copilot.llm.prompt_templates import build_system_prompt, build_user_prompt
 from meeting_copilot.nlp.question_detector import get_question_detector
-from meeting_copilot.pipeline.events import Answer, RetrievedContext, SpeechSegment, Transcript
+from meeting_copilot.pipeline.events import (
+    Answer,
+    AudioHealth,
+    RetrievedContext,
+    SpeechSegment,
+    Transcript,
+)
 from meeting_copilot.pipeline.metrics import PIPELINE_TOTAL_LATENCY_SECONDS, StageTimer
 from meeting_copilot.retrieval.hybrid_search import HybridSearcher
 from meeting_copilot.retrieval.qa_bank import QaBankStore
@@ -41,6 +47,12 @@ logger = get_logger()
 
 OnAnswer = Callable[[Answer], Awaitable[None]]
 OnPartialAnswer = Callable[[str], Awaitable[None]]
+OnAudioHealth = Callable[[AudioHealth], Awaitable[None]]
+
+# How often the watchdog polls AudioCapture.health(). A state CHANGE is what actually gets
+# logged/pushed (see _watchdog_loop) -- this just bounds how quickly a transition is
+# noticed, so it can stay short without spamming anything.
+_AUDIO_HEALTH_POLL_SECONDS = 2.0
 
 # VAD's min_silence_ms gap can split one continuous, paused-and-continued question into
 # multiple segments. If the next segment from the SAME speaker arrives within this many
@@ -339,10 +351,13 @@ class MeetingPipeline:
         self,
         on_answer: OnAnswer | None = None,
         on_partial_answer: OnPartialAnswer | None = None,
+        on_audio_health: OnAudioHealth | None = None,
     ):
         """on_answer: async callable(Answer) -> None, e.g. push over the overlay WebSocket.
         on_partial_answer: async callable(text_so_far) -> None, called as the answer streams in
-        (skipped on a cache hit, since that's already instant)."""
+        (skipped on a cache hit, since that's already instant).
+        on_audio_health: async callable(AudioHealth) -> None, called only on a STATE
+        transition (not every poll) -- see _watchdog_loop."""
         self._cfg = get_config()
         self._capture = AudioCapture()
         self._vad = SileroVAD()
@@ -362,10 +377,12 @@ class MeetingPipeline:
         self._cache = RedisCache()
         self._on_answer = on_answer
         self._on_partial_answer = on_partial_answer
+        self._on_audio_health = on_audio_health
 
         self._running = False
         self._run_task: asyncio.Task | None = None
         self._worker_task: asyncio.Task | None = None
+        self._watchdog_task: asyncio.Task | None = None
         self._segment_queue: asyncio.Queue[SpeechSegment] = asyncio.Queue()
         self._pending_transcript: Transcript | None = None
         self._last_answered: Transcript | None = None
@@ -846,6 +863,33 @@ class MeetingPipeline:
         except Exception:
             logger.exception("Error processing transcript")
 
+    async def _watchdog_loop(self) -> None:
+        """Poll AudioCapture.health() on a timer and surface every STATE transition.
+
+        Separate from the VAD/STT pipeline on purpose: those only run when speech is
+        detected, so they have no way to notice "nothing is coming through at all" -- a
+        dead/silent audio stream looks identical to an interviewer who just hasn't spoken.
+        Observability only for now, no automatic recovery -- see AudioHealth / _CALLBACK_
+        STALL_SECONDS etc. in audio/capture.py for the reasoning behind the thresholds.
+        """
+        last_state: str | None = None
+        while self._running:
+            try:
+                health = self._capture.health()
+                if health.state != last_state:
+                    logger.warning(
+                        f"Audio health: {last_state} -> {health.state}"
+                        + (f" reason={health.reason}" if health.reason else "")
+                        + f" (peak={health.last_peak:.4f} rms={health.last_rms:.4f} "
+                        f"callbacks={health.callback_count})"
+                    )
+                    last_state = health.state
+                    if self._on_audio_health:
+                        await self._on_audio_health(health)
+            except Exception:
+                logger.exception("Error in audio watchdog")
+            await asyncio.sleep(_AUDIO_HEALTH_POLL_SECONDS)
+
     async def _consume_queue(self) -> None:
         """Single worker: handles exactly one segment at a time, strictly in spoken order,
         so overlay updates from different questions can never race each other."""
@@ -863,6 +907,7 @@ class MeetingPipeline:
         self._running = True
         logger.info("Meeting pipeline started")
         self._worker_task = asyncio.create_task(self._consume_queue())
+        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
         async for segment in self._vad.segments(self._capture.frames()):
             if not self._running:
                 break
@@ -870,6 +915,18 @@ class MeetingPipeline:
             # busy on a previous segment -- nothing is ever dropped, only queued.
             self._segment_queue.put_nowait(segment)
         logger.info("Meeting pipeline stopped")
+
+    def audio_health(self) -> AudioHealth:
+        """Current audio health, queryable on demand -- not just on a state transition.
+
+        Needed because _watchdog_loop only pushes on CHANGE: a client (the overlay) that
+        connects between two transitions would otherwise never learn the current state
+        until the next one happens to fire, which could be arbitrarily far away if the
+        state is stable. Observed live: the backend transitioned to AUDIO_INPUT_LOST at
+        T, the overlay connected at T+12s, and never saw it -- this is what the server's
+        websocket endpoint calls right after a new connection to close that gap.
+        """
+        return self._capture.health()
 
     def start(self) -> None:
         self._run_task = asyncio.create_task(self.run())
@@ -880,4 +937,6 @@ class MeetingPipeline:
             self._run_task.cancel()
         if self._worker_task:
             self._worker_task.cancel()
+        if self._watchdog_task:
+            self._watchdog_task.cancel()
         await self._cache.close()

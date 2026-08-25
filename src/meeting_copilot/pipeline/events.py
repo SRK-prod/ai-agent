@@ -90,3 +90,26 @@ class Answer:
     format_type: str  # "prose" | "bullets" | "code" | "table"
     confidence: float
     low_confidence: bool
+
+
+@dataclass
+class AudioHealth:
+    """Point-in-time read of whether the audio capture stream is actually delivering usable
+    signal -- see audio/capture.py AudioCapture.health(). Distinguishes "the interviewer
+    is quiet" from "the pipeline stopped hearing them", which look identical downstream
+    (no transcripts) but need very different responses.
+    """
+
+    state: str  # "AUDIO_ACTIVE" | "AUDIO_SILENT" | "AUDIO_INPUT_LOST"
+    # Only set when state != AUDIO_ACTIVE. "CALLBACK_STALLED" (the capture callback itself
+    # stopped firing -- device/stream problem) vs "ZERO_SIGNAL" (callbacks are arriving but
+    # every buffer is silent -- could be a routing problem, e.g. the Multi-Output/Aggregate
+    # device losing the actual source). Not shown in the overlay, logged on every state
+    # transition -- this is exactly the detail that was missing to diagnose past live
+    # dropouts after the fact.
+    reason: str | None
+    seconds_since_signal: float
+    seconds_since_callback: float
+    last_peak: float
+    last_rms: float
+    callback_count: int

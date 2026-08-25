@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPainterPath, QPaintEvent
-from PySide6.QtWidgets import QLabel, QScrollArea, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QScrollArea, QVBoxLayout, QWidget
 
 from meeting_copilot.config import OverlayConfig, get_config
 
@@ -17,6 +17,19 @@ _COLLAPSED_SIZE = (600, 520)
 _EXPANDED_SIZE = (680, 820)
 _PANEL_COLOR = QColor(20, 20, 24, 235)
 _PANEL_RADIUS = 12.0
+
+# Small, unobtrusive inline indicator -- normal operation, never meant to draw the eye.
+_AUDIO_STATUS_STYLE = {
+    "AUDIO_ACTIVE": ("color: #6fcf6f; font-size: 11px;", "\U0001f7e2 Audio"),
+    "AUDIO_SILENT": ("color: #e0c34c; font-size: 11px;", "\U0001f7e1 Audio quiet"),
+}
+# Deliberately the opposite -- AUDIO_INPUT_LOST means the pipeline stopped hearing the
+# interviewer entirely, which needs action, not a quiet color change.
+_AUDIO_LOST_TEXT = "\U0001f534 AUDIO INPUT LOST\nCheck microphone/audio\nRestart capture if needed"
+_AUDIO_LOST_STYLE = (
+    "background-color: rgba(180, 40, 40, 0.92); color: white; font-weight: bold; "
+    "font-size: 12px; padding: 8px 12px; border-radius: 6px; border: 1px solid #ff6b6b;"
+)
 
 
 class OverlayWindow(QWidget):
@@ -39,8 +52,26 @@ class OverlayWindow(QWidget):
         )
 
         layout = QVBoxLayout(self)
+
+        # Audio health banner: hidden unless the stream is actually lost -- see
+        # show_audio_health(). Sits above everything else so it's impossible to miss when
+        # it does appear, but takes zero space otherwise.
+        self._audio_lost_banner = QLabel(_AUDIO_LOST_TEXT)
+        self._audio_lost_banner.setStyleSheet(_AUDIO_LOST_STYLE)
+        self._audio_lost_banner.setWordWrap(True)
+        self._audio_lost_banner.hide()
+        layout.addWidget(self._audio_lost_banner)
+
+        header_row = QHBoxLayout()
         self._header_label = QLabel("meeting-copilot: listening…")
         self._header_label.setStyleSheet("font-weight: bold; color: #8ab4f8;")
+        # Small inline audio-health indicator (🟢/🟡) -- normal-operation state, deliberately
+        # subtle. Starts blank: no health report has arrived yet at window construction.
+        self._audio_status_label = QLabel("")
+        header_row.addWidget(self._header_label, 1)
+        header_row.addWidget(self._audio_status_label)
+        layout.addLayout(header_row)
+
         self._answer_label = QLabel("")
         self._answer_label.setWordWrap(True)
         self._answer_label.setTextFormat(Qt.TextFormat.MarkdownText)
@@ -59,7 +90,6 @@ class OverlayWindow(QWidget):
         self._confidence_label = QLabel("")
         self._confidence_label.setStyleSheet("color: #aaaaaa; font-size: 11px;")
 
-        layout.addWidget(self._header_label)
         layout.addWidget(self._scroll, stretch=1)
         layout.addWidget(self._confidence_label)
 
@@ -108,6 +138,28 @@ class OverlayWindow(QWidget):
         self._confidence_label.setText(f"confidence: {confidence * 100:.0f}%")
         self.show()
         self.raise_()
+
+    def show_audio_health(self, data: dict) -> None:
+        """Reflects an AudioHealth state transition (see audio/capture.py, pipeline/
+        orchestrator.py _watchdog_loop) -- called only when the state actually changes,
+        not on every watchdog poll. AUDIO_ACTIVE/AUDIO_SILENT are a small inline indicator
+        that never forces the window visible -- routine states shouldn't interrupt a
+        candidate who intentionally hid the overlay. AUDIO_INPUT_LOST is the one state that
+        needs action, so it gets a hard-to-miss banner and forces the window visible even
+        if it was hidden or unpinned.
+        """
+        state = data.get("state", "AUDIO_ACTIVE")
+        if state == "AUDIO_INPUT_LOST":
+            self._audio_status_label.setText("")
+            self._audio_lost_banner.show()
+            self.show()
+            self.raise_()
+            return
+
+        self._audio_lost_banner.hide()
+        style, text = _AUDIO_STATUS_STYLE.get(state, _AUDIO_STATUS_STYLE["AUDIO_ACTIVE"])
+        self._audio_status_label.setStyleSheet(style)
+        self._audio_status_label.setText(text)
 
     def toggle_hidden(self) -> None:
         self.hide() if self.isVisible() else self.show()

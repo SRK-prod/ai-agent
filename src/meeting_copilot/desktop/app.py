@@ -27,6 +27,7 @@ logger = get_logger()
 class WebSocketBridge(QObject):
     answer_received = Signal(dict)
     partial_answer_received = Signal(str)
+    audio_health_received = Signal(dict)
 
 
 class BackendClient:
@@ -52,6 +53,8 @@ class BackendClient:
                             self._bridge.answer_received.emit(message["data"])
                         elif message.get("type") == "answer_partial":
                             self._bridge.partial_answer_received.emit(message["data"]["text"])
+                        elif message.get("type") == "audio_health":
+                            self._bridge.audio_health_received.emit(message["data"])
             except Exception as exc:  # noqa: BLE001 -- any failure here just means retry
                 logger.warning(f"Backend WebSocket connection lost ({exc}); retrying in 3s")
                 await asyncio.sleep(3)
@@ -70,6 +73,7 @@ def main() -> None:
     bridge = WebSocketBridge()
     bridge.answer_received.connect(overlay.show_answer)
     bridge.partial_answer_received.connect(overlay.show_partial_answer)
+    bridge.audio_health_received.connect(overlay.show_audio_health)
     ws_url = f"ws://{cfg.secrets.host}:{cfg.secrets.port}/ws"
     BackendClient(ws_url, bridge).start()
 
