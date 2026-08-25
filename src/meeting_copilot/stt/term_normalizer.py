@@ -182,6 +182,13 @@ _PHRASE_FIXES: dict[str, str] = {
     "jenkins": "Jenkins",
     "blue green": "blue/green",
     # AI / GenAI ---------------------------------------------------------------------
+    # "agent decay" observed live 2026-08-25: Whisper mis-heard "Agentic AI" as this on
+    # compressed video-call audio. Safe to fix -- "agent decay" has no legitimate meaning
+    # in an infrastructure/AI interview, unlike single ambiguous words (see the note in
+    # this file's module docstring about NOT blanket-fixing common words like "phone").
+    "agent decay": "Agentic AI",
+    "agentic decay": "Agentic AI",
+    "urgent decay": "Agentic AI",
     "bed rock": "Bedrock",
     "bedrock": "Bedrock",
     "sage maker": "SageMaker",
