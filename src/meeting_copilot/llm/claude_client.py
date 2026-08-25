@@ -23,6 +23,7 @@ from collections.abc import AsyncIterator
 from typing import Protocol
 
 from meeting_copilot.config import LlmConfig, get_config
+from meeting_copilot.llm.prompt_templates import CACHE_BREAKPOINT
 from meeting_copilot.utils.logging import get_logger
 
 logger = get_logger()
@@ -91,7 +92,8 @@ class ClaudeCliBackend:
     async def complete(self, prompt: str, system: str | None = None) -> str:
         cmd = [self._cfg.cli_binary, "-p", prompt, "--output-format", "json"]
         if system:
-            cmd += ["--append-system-prompt", system]
+            # Text-only backend: the cache breakpoint is an API-block concept, strip it.
+            cmd += ["--append-system-prompt", system.replace(CACHE_BREAKPOINT, "\n\n")]
         if self._session_id:
             cmd += ["--resume", self._session_id]
 
@@ -128,7 +130,8 @@ class ClaudeCliBackend:
     async def stream(self, prompt: str, system: str | None = None) -> AsyncIterator[str]:
         cmd = [self._cfg.cli_binary, "-p", prompt, "--output-format", "stream-json"]
         if system:
-            cmd += ["--append-system-prompt", system]
+            # Text-only backend: the cache breakpoint is an API-block concept, strip it.
+            cmd += ["--append-system-prompt", system.replace(CACHE_BREAKPOINT, "\n\n")]
         if self._session_id:
             cmd += ["--resume", self._session_id]
 
@@ -174,8 +177,18 @@ class ClaudeApiBackend:
         if not system:
             return self._anthropic.NOT_GIVEN  # omit the param entirely, not None
         # cache_control lets repeated calls in the same meeting reuse the (large,
-        # unchanging) persona/instructions prefix instead of re-billing for it.
-        return [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+        # unchanging) persona/instructions prefix instead of re-billing for it. The
+        # breakpoint MUST sit between the static prefix and the per-question tail: a single
+        # block spanning both is a cache key that changes with every question category, so
+        # nothing ever hits (measured 2026-08-24: cache_read=0 on every call, ~21K tokens
+        # re-billed each time; after the split, cache_read≈18.9K on every call but the first).
+        static, marker, tail = system.partition(CACHE_BREAKPOINT)
+        if not marker:  # no breakpoint (e.g. a caller-supplied prompt) -- cache it whole
+            return [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+        return [
+            {"type": "text", "text": static, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": tail},
+        ]
 
     async def complete(self, prompt: str, system: str | None = None) -> str:
         last_exc: Exception | None = None
@@ -241,7 +254,10 @@ class OpenAiApiBackend:
     def _messages(self, prompt: str, system: str | None):
         messages = []
         if system:
-            messages.append({"role": "system", "content": system})
+            # Text-only backend: the cache breakpoint is an API-block concept, strip it.
+            messages.append(
+                {"role": "system", "content": system.replace(CACHE_BREAKPOINT, "\n\n")}
+            )
         messages.append({"role": "user", "content": prompt})
         return messages
 
