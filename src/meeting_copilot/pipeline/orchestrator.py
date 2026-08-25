@@ -48,15 +48,30 @@ OnPartialAnswer = Callable[[str], Awaitable[None]]
 # instead of answering a fragment out of context.
 _FRAGMENT_MERGE_GAP_SECONDS = 3.0
 
-# An interviewer very often asks a question, pauses while you start thinking, then adds
-# qualifiers ("...and how would that change under load?"). Beyond the short merge gap above
-# we've usually already answered -- so within this longer window we re-answer the COMBINED
-# question and supersede the previous answer on the overlay, rather than answering the
-# addition in isolation with no idea what it refers to.
-_SUPERSEDE_WINDOW_SECONDS = 35.0  # was 15.0 -- too short for a genuine thinking pause.
-# Observed live 2026-08-25: "tell me about Terraform" [~30s pause] "how can you integrate
-# it with Agentic AI" was answered as two disconnected questions instead of one merged
-# answer, because the real-world pause exceeded the old 15s window.
+# ANSWER REVISION WINDOW (redesigned 2026-08-25, replacing the earlier "wait before
+# answering" compound-question approach). Every detected question is answered immediately --
+# no upfront wait beyond the short fragment debounce below. The trade-off moves to AFTER
+# generation instead of before it: once an answer is shown, it stays "open for revision" for
+# this many seconds. If another legitimate interviewer question arrives inside that window
+# (an explicit pivot like "forget that"/"let's move to" always excepted -- see
+# _NEW_QUESTION_OPENERS), it is folded into the SAME question set, the combined question is
+# re-answered, and the new answer REPLACES the one on the overlay -- the interviewer never
+# sees two separate write-ups for what was really one connected exchange. This covers both
+# a quick back-to-back follow-up ("What is Terraform?" [3s] "How should you have integrated
+# AI?") and a genuine thinking-pause addition ("tell me about Terraform" [~30s pause] "how
+# can you integrate it with Agentic AI") with one mechanism, because both are just "a new
+# question inside the window" -- there's no need to guess in advance whether a second
+# question is coming, so the ~1-1.5s baseline time-to-first-answer is never taxed for
+# questions that turn out to be standalone. Capped at _MAX_REVISION_QUESTIONS so an
+# interviewer who keeps talking for the full window doesn't get one giant answer covering
+# six unrelated questions. Configurable in this one place; 30s is an initial default to be
+# tuned from real interview use, not a permanent value.
+_ANSWER_REVISION_WINDOW_SECONDS = 30.0
+
+# How many questions may be folded into one revised answer before a further question inside
+# the window is instead treated as the start of a brand-new turn. Prevents unbounded
+# accumulation ("Q1... Q2... Q3... Q4... Q5...") into a single unreadable answer.
+_MAX_REVISION_QUESTIONS = 3
 
 # An interviewer describing a multi-sentence scenario ("Two services show correlated
 # anomalies with no dependency between them... a BigPanda alert fires for the payment
@@ -77,23 +92,6 @@ _SCENARIO_CONTEXT_WINDOW_SECONDS = 25.0
 # candidate actually feels. Cut to 0.5s: the supersede path already re-answers late
 # additions, so a long debounce is largely redundant protection paid for on every question.
 _QUESTION_DEBOUNCE_SECONDS = 0.5
-
-# Time-based compound-turn grouping (added 2026-08-25): an interviewer who asks two
-# distinct questions back to back ("What is Terraform?" [3s] "How should you have
-# integrated AI?") should get ONE combined answer, not two separate ones -- these were
-# previously answered independently even when only a few seconds apart, because nothing
-# checked for a SECOND complete question following close behind the first.
-#
-# This is a real, deliberate trade-off, not a free improvement: every genuinely standalone
-# question now also waits up to this long before an answer starts, because the pipeline
-# cannot know in advance whether a second question is coming. Measured baseline TTFA this
-# session was ~1-1.5s; this constant is added on top of that for every question that isn't
-# a same-utterance fragment. Kept short (well under the 30s example in the original ask)
-# specifically to protect that baseline -- it's tuned to catch a real quick follow-up, not
-# a long thinking pause (that case is handled separately, and without any upfront wait, by
-# _SUPERSEDE_WINDOW_SECONDS + the anaphora check in _reads_as_independent_question).
-# Configurable in one place, not hardcoded elsewhere -- see _handle_segment/_debounced_process.
-_QUESTION_MERGE_WINDOW_SECONDS = 4.0
 
 # How many (question, answer) pairs to keep for follow-up context.
 _CONVERSATION_MEMORY_TURNS = 3
@@ -371,6 +369,15 @@ class MeetingPipeline:
         self._segment_queue: asyncio.Queue[SpeechSegment] = asyncio.Queue()
         self._pending_transcript: Transcript | None = None
         self._last_answered: Transcript | None = None
+        # How many questions are folded into the answer currently in _last_answered.
+        # Tracked as explicit state rather than parsed back out of the merged text --
+        # parsing "Question N:" labels undercounts once a dependent follow-up in the middle
+        # of a merge chain falls back to plain concatenation instead of numbering (a
+        # genuine question can depend on the previous one via anaphora -- "what about
+        # security for THAT setup?" -- while still being a distinct question that should
+        # count against the cap). Reset to 1 on every genuinely new turn, incremented on
+        # every successful revision merge -- see _MAX_REVISION_QUESTIONS.
+        self._revision_count = 0
         # Rolling conversation memory: the last few (question, answer) pairs. Without this,
         # every question is answered in isolation -- which is why bare follow-ups ("Why?",
         # "What about 100k events/sec?", "Give me an example") were previously answered as
@@ -442,27 +449,33 @@ class MeetingPipeline:
                 pending is None
                 and self._last_answered is not None
                 and (transcript.start_time - self._last_answered.end_time)
-                < _SUPERSEDE_WINDOW_SECONDS
-                and _is_question_enhancement(transcript.text)
-                and not self._reads_as_independent_question(transcript)
+                < _ANSWER_REVISION_WINDOW_SECONDS
+                and _is_question_enhancement(transcript.text)  # no explicit pivot phrase
+                and self._revision_count < _MAX_REVISION_QUESTIONS
             ):
-                # ENHANCEMENT / SUPERSEDE: we already answered, then the same speaker added
-                # detail to the SAME question -- "how would you design event correlation?"
-                # [pause] "specifically across Splunk and Prometheus in a bank". Answering
-                # the addition alone loses the original question, so re-answer the COMBINED
-                # question and replace the previous answer on the overlay.
-                merged_text = f"{self._last_answered.text} {transcript.text}".strip()
+                # ANSWER REVISION: we already answered, and within the revision window the
+                # same speaker either (a) added detail to the SAME question -- "how would
+                # you design event correlation?" [pause] "specifically across Splunk and
+                # Prometheus in a bank" -- or (b) asked a genuinely NEW question -- "What is
+                # Terraform?" [3s] "How should you have integrated AI?". Both cases fold into
+                # the SAME answer: re-answer the combined question set and replace the
+                # previous answer on the overlay, rather than leaving the addition unanswered
+                # or starting a disconnected second answer. _format_pending_addition tells
+                # the two cases apart (numbered "Question 1:/Question 2:" for a genuinely
+                # independent new question, plain concatenation for a same-question addition)
+                # -- see its docstring.
+                merged_text = self._format_pending_addition(self._last_answered.text, transcript)
                 # Guard against re-answering the same thing forever. Whisper re-emits
                 # near-identical text for echo/noise tails, and without this the merged
                 # question barely changes yet still triggers a full cancel+regenerate --
                 # observed live as the same answer restarting 4 times in 20 seconds.
                 if not _materially_different(merged_text, self._last_answered.text):
                     logger.info(
-                        f"Enhancement adds nothing new, keeping current answer: "
+                        f"Revision adds nothing new, keeping current answer: "
                         f"{transcript.text[:60]!r}"
                     )
                     return
-                logger.info(f"ENHANCEMENT detected -- merged question: {merged_text!r}")
+                logger.info(f"ANSWER REVISION -- merged question: {merged_text!r}")
                 pending = Transcript(
                     speaker_id=transcript.speaker_id,
                     text=merged_text,
@@ -470,22 +483,21 @@ class MeetingPipeline:
                     end_time=transcript.end_time,
                     language=transcript.language,
                 )
+                self._revision_count += 1
                 wait_seconds = _QUESTION_DEBOUNCE_SECONDS
             else:
-                # Genuinely new utterance, no in-flight ENHANCEMENT match. Two cases:
-                #   (a) pending is None -- the very first question in a while.
-                #   (b) pending is NOT None -- a previous question is still waiting out
-                #       ITS OWN merge window (below), and this is a second, likely-distinct
-                #       question arriving close behind it. Time-based compound grouping
-                #       (2026-08-25): fold it in rather than answering the first one alone.
-                # Either way this is a genuinely new-question event, so the wait before
-                # committing is the longer merge window, not the short fragment debounce --
-                # see _QUESTION_MERGE_WINDOW_SECONDS for the latency trade-off this implies.
+                # Genuinely new turn -- no active answer to revise (none yet, outside the
+                # revision window, an explicit pivot, or the revision cap was already hit).
+                # Answered immediately: only the short fragment debounce applies, same as
+                # any other question. If pending is already set here, a second segment
+                # arrived inside that same short debounce (a tight race, not the normal
+                # path) -- fold it in with the same formatting rather than losing it.
                 if pending is not None:
                     transcript.text = self._format_pending_addition(pending.text, transcript)
                     transcript.start_time = pending.start_time
                 pending = transcript
-                wait_seconds = _QUESTION_MERGE_WINDOW_SECONDS
+                self._revision_count = 1
+                wait_seconds = _QUESTION_DEBOUNCE_SECONDS
 
             # Only NOW is it worth interrupting: this segment genuinely changes the question.
             self._cancel_active_generation("question changed")
@@ -528,26 +540,30 @@ class MeetingPipeline:
         return detected is not None and detected.has_interrogative_signal
 
     def _format_pending_addition(self, old_text: str, new_transcript: Transcript) -> str:
-        """Join a newly-arrived segment onto a still-pending (undebounced) transcript.
+        """Join a newly-arrived segment onto prior question text -- either a still-pending
+        (undebounced) transcript, or (via the answer revision window) an already-answered
+        question being revised.
 
-        Time-based compound-turn grouping, added 2026-08-25: if the new segment
-        independently reads as its own complete question (has its own interrogative
-        signal, no anaphoric dependency on old_text -- see _reads_as_independent_question),
-        this is very likely a genuinely SECOND question asked close behind the first, not a
-        continuation of the same one. Format it as an explicit numbered compound turn
-        ("Question 1: ... Question 2: ...") so the answer generator addresses both
+        Whether to number depends ONLY on the NEW segment's own independence (has its own
+        interrogative signal, no anaphoric dependency -- see _reads_as_independent_question),
+        not on re-checking old_text. old_text can already be a multi-question accumulated
+        blob (from an earlier merge in this same revision chain); re-running the anaphora
+        check against that whole blob is unreliable once it contains an earlier dependent
+        clause -- e.g. after folding in "what about security for THAT setup?", the phrase
+        "for that" now sits somewhere in the middle of old_text and would wrongly flag the
+        entire blob as anaphoric on every later check, breaking numbering for a genuinely
+        independent question that comes after it. old_text was already validated as
+        answerable when it was first set, so it doesn't need re-validating here.
+
+        If the new segment reads independent -- format it as an explicit numbered compound
+        turn ("Question 1: ... Question 2: ...") so the answer generator addresses both
         distinctly, rather than a bare space-joined concatenation that reads as one
-        run-on/garbled sentence. A fragment continuation (old_text was cut off mid-thought,
-        or the new segment leans on "it"/"that") still gets the plain concatenation this
-        always did, since numbering a broken sentence would be wrong.
+        run-on/garbled sentence. A genuinely dependent addition (leans on "it"/"that" to
+        mean what was just discussed) still gets the plain concatenation this always did,
+        since numbering a fragment or an anaphoric clause as its own "question" would be
+        wrong -- it folds into the question it depends on instead.
         """
-        old_probe = Transcript(
-            speaker_id=new_transcript.speaker_id, text=old_text, start_time=0, end_time=0
-        )
-        both_are_questions = self._reads_as_independent_question(
-            new_transcript
-        ) and self._reads_as_independent_question(old_probe)
-        if not both_are_questions:
+        if not self._reads_as_independent_question(new_transcript):
             cleaned = _strip_leading_repeated_filler(old_text)
             return f"{cleaned} {new_transcript.text}".strip()
 
@@ -565,12 +581,12 @@ class MeetingPipeline:
             logger.info(f"Cancelled in-flight answer generation: {reason}")
 
     async def _debounced_process(self, wait_seconds: float = _QUESTION_DEBOUNCE_SECONDS) -> None:
-        """Wait before committing to an answer -- either a short beat (guards against
-        answering half a question if the interviewer is pausing mid-sentence) or the
-        longer compound-question merge window (guards against answering the first of two
-        back-to-back questions before the second has had a chance to arrive and get
-        folded in -- see _QUESTION_MERGE_WINDOW_SECONDS). The caller decides which applies
-        per segment; either way, any new speech inside the window cancels this timer.
+        """Wait a short beat before committing to an answer -- guards against answering half
+        a question if the interviewer is pausing mid-sentence. Any new speech inside the
+        window cancels this timer and extends the pending question instead. Deliberately
+        always short: compound-question grouping happens AFTER an answer exists, via the
+        answer revision window (_ANSWER_REVISION_WINDOW_SECONDS), not by delaying the first
+        answer.
         """
         try:
             await asyncio.sleep(wait_seconds)
@@ -747,8 +763,8 @@ class MeetingPipeline:
             if len(compound_matches) >= 2:
                 compound_instruction = (
                     "\n\nCOMPOUND TURN -- the interviewer asked "
-                    f"{len(compound_matches)} questions in immediate succession (a few "
-                    "seconds apart), numbered above. Answer ALL of them, in one natural "
+                    f"{len(compound_matches)} questions in close succession, numbered "
+                    "above. Answer ALL of them, in one natural "
                     "flowing response as a candidate would actually speak it -- not "
                     "'Answer 1: ... Answer 2: ...' unless the questions are complex enough "
                     "that explicit separation genuinely improves clarity. Do not ignore any "
