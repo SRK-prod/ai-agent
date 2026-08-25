@@ -15,29 +15,88 @@ from meeting_copilot.pipeline.events import RetrievedContext
 
 CONFIDENCE_MARKER = "CONFIDENCE:"
 
+# Splits the system prompt into its cacheable static prefix and its per-question tail.
+# Never appears in text sent to a model: API backends split on it, text-only backends
+# strip it (see llm/claude_client.py).
+CACHE_BREAKPOINT = "\n<<<PROMPT_CACHE_BREAKPOINT>>>\n"
+
 
 def _classify_category(question_text: str) -> str:
     """Classify by question SHAPE, not topic -- a Kubernetes question can be scenario,
-    architecture, or comparison depending on phrasing. Checked in priority order: the most
-    lexically distinctive shapes first, so e.g. an AI-flavoured comparison question ("RAG vs
-    fine-tuning") still gets the comparison template rather than the AI one."""
+    architecture, security or comparison depending on phrasing. Checked in priority order:
+    the most lexically distinctive shapes first, so e.g. an AI-flavoured comparison
+    question ("RAG vs fine-tuning") still gets the trade_off template, and a "design a
+    highly available EKS platform" question gets the full architecture template rather
+    than the narrower standalone kubernetes template."""
     t = question_text.lower()
+
+    # "why not X" / "why didn't you use X" -- a challenge to a decision already made.
+    # Checked first: it is lexically unmistakable and must not be swallowed by trade_off.
+    if re.search(r"\bwhy (not|didn'?t|don'?t|wouldn'?t)\b", t):
+        return "why_not"
+
+    # Failure / negative scenario -- "what if X fails", "what happens if X goes down"
+    if re.search(r"\bwhat (if|happens (if|when))\b.{0,60}\b(fail|fails|down|unavailable|"
+                 r"outage|crashes|dies|breaks|lost|goes away)\b", t) or any(
+        m in t for m in ("if the region fails", "region goes down", "entire region",
+                         "fails closed", "fails open", "single point of failure")):
+        return "failure_negative"
+
+    # Migration
+    if any(m in t for m in ("migrate", "migration", "move from", "moving from", "port from",
+                            "lift and shift", "rehost", "replatform", "cut over", "cutover")):
+        return "migration"
+
+    # HA / DR -- checked before generic aws/architecture so RTO/RPO framing wins
+    if any(m in t for m in ("high availability", "highly available", "disaster recovery",
+                            " dr ", "rto", "rpo", "failover", "multi-region", "multi region",
+                            "active-active", "active-passive", "business continuity")):
+        return "ha_dr"
+
+    # Scalability / performance
+    if any(m in t for m in ("scale to", "scaling to", "10x", "100x", "bottleneck",
+                            "throughput", "under load", "handle more traffic", "capacity plan",
+                            "performance tuning", "scale this", "scale it", "load test")):
+        return "scalability"
+
+    # Cost / FinOps
+    if any(m in t for m in ("cost", "finops", "spend", "bill", "budget", "cheaper",
+                            "expensive", "savings plan", "reserved instance", "rightsiz")):
+        return "cost_finops"
+
+    # Project ownership
+    if any(m in t for m in ("biggest project", "most challenging project", "project you owned",
+                            "project you led", "walk me through a project", "proudest",
+                            "most complex project", "end to end project")):
+        return "project_ownership"
 
     if any(m in t for m in (" vs ", " vs. ", " versus ", "difference between", "compare ",
                              "pros and cons", "when would you use", "when do you choose",
-                             "which would you choose", "which one would you",
+                             "when would you choose", "which would you choose",
+                             "which one would you",
                              "ways to", "different ways", "how many ways", "what are the ways",
                              "methods to", "different methods", "different approaches")):
-        return "comparison"
+        return "trade_off"
+
+    # "choose X over Y" / "pick X over Y" / "prefer X over Y" -- another common trade-off
+    # phrasing that doesn't use "vs" or "when would you use".
+    if re.search(r"\b(choose|pick|prefer|go with)\b.+\bover\b", t):
+        return "trade_off"
 
     # "run one X from another", "call one X from another" etc. -- implicitly asks for every
     # standard mechanism to relate two same-type things, which is a comparison-shaped answer
     # (enumerate options, trade-offs, recommendation) even without an explicit "vs"/"ways to".
     if re.search(r"\b(run|call|trigger|invoke)\b.+\bfrom another\b", t):
-        return "comparison"
+        return "trade_off"
+
+    # Behavioral STAR -- "tell me about a time" is the classic opener and gets the STAR
+    # shape rather than the leadership shape.
+    if any(m in t for m in ("tell me about a time", "describe a time",
+                            "give me an example of a time", "walk me through a time")):
+        return "behavioral"
 
     if any(m in t for m in (
-        "tell me about a time", "describe a time", "describe a situation",
+        "describe a situation",
         "give me an example of a time", "give an example of a time",
         "walk me through a time", "walk me through a conflict",
         "how did you handle", "how do you handle a difficult",
@@ -46,8 +105,144 @@ def _classify_category(question_text: str) -> str:
         "tell me about a challenge", "tell me about a failure",
         "tell me about a mistake", "influence without authority",
         "difficult stakeholder", "difficult team member", "underperforming",
+        "drive a platform standard", "influence without authority",
+        "cross-team", "without direct authority",
+        # Added 2026-08-24: plain present-tense people questions ("how do you mentor
+        # junior engineers?") previously fell through every branch to the tool_technology
+        # catch-all. Kept as specific phrases rather than bare "stakeholder"/"team", which
+        # would steal genuine architecture questions ("design a platform with stakeholder
+        # buy-in").
+        "mentor", "coaching", "coach a", "junior engineer", "junior developer",
+        "grow the team", "team morale", "performance review", "one-on-one", "1:1",
+        "disagreement with", "disagree with", "senior stakeholder", "manage stakeholder",
+        "stakeholder buy-in", "push back on a", "convince the team", "convince your team",
+        "technical debt prioriti", "say no to", "onboarding engineers",
     )):
         return "leadership"
+
+    if any(m in t for m in (
+        "tell me about yourself", "walk me through your background",
+        "give me your career summary", "your career summary", "your background",
+        "introduce yourself", "walk me through your experience", "your journey",
+    )):
+        return "career_narrative"
+
+    # Design/build/architect phrasing wins over a narrower domain keyword below --
+    # "design a highly available EKS platform" is an architecture question, not a
+    # standalone kubernetes one. Checked before the domain-specific categories.
+    is_design_phrasing = any(m in t for m in (
+        "design a ", "design an ", "design the ", "design your ", "design our ",
+        "how would you design", "architect a ", "architect an ",
+        "how would you build", "build a system", "build a platform",
+        "propose an architecture", "system design", "design the architecture",
+        "how would you architect", "target-state architecture", "target state architecture",
+        "why did you design", "why did you choose", "why did you build", "why did you go with",
+        "why did you use", "why two", "why not one", "why not a single",
+        "walk me through the architecture", "walk me through your architecture",
+        "walk me through the complete architecture", "walk me through the system",
+        "explain the architecture", "overview of the architecture", "overview of your architecture",
+        "component level of architecture", "component-level architecture",
+    ))
+    if is_design_phrasing:
+        return "architecture"
+
+    # Strong incident/triage framing wins over a bare domain-keyword match below --
+    # "payment microservice throwing 503s, pods OOMKilled, walk me through your triage" is
+    # a broader production-incident question (customer impact, multiple symptoms) that
+    # needs the full Situation->Impact->Investigation->Mitigation->RCA shape, not just the
+    # narrower Kubernetes-specific troubleshooting sub-case that a bare "OOMKilled" keyword
+    # match below would otherwise route it to. A single narrow K8s-mechanics symptom with
+    # no broader incident framing (e.g. "pods are continuously restarting, how do you
+    # troubleshoot") still falls through to the kubernetes category further down.
+    if any(m in t for m in (
+        "triage", "walk me through your triage", "declare an incident", "on-call",
+        "sev1", "sev2", "sev 1", "sev 2", "p1 incident", "p2 incident",
+    )):
+        return "scenario_troubleshooting"
+
+    # Pure definitional phrasing ("what is X", "how does X work") wins over a domain
+    # keyword match below -- "What is OpenTelemetry?" is a tool/technology explainer
+    # question, not an observability-platform design question, even though it names a
+    # word that also appears in the observability domain keyword list.
+    # ...but "what is your approach to X" / "what's your take on X" is NOT definitional --
+    # it asks how the candidate works, not what the technology is. Measured 2026-08-24:
+    # "What is your approach to AIOps?" was answered with a "## What Is It" explainer of
+    # AIOps instead of the candidate's own AIOps approach.
+    _asks_for_own_view = re.search(
+        r"\bwhat(?:'s| is| are)\s+(?:your|our)\s+"
+        r"(approach|take|view|opinion|philosophy|experience|strategy|thoughts?|process)\b",
+        t,
+    )
+    if not _asks_for_own_view and (
+        t.strip().startswith(("what is ", "what's ", "what are ", "what does ")) and
+        len(t.split()) <= 7 and "would" not in t and "how" not in t
+    ):
+        return "definition"
+
+    if not _asks_for_own_view and (
+        t.strip().startswith(("what is ", "what's ", "what are ", "what does ")) or re.search(
+        r"\bhow does\b.+\bwork\b", t
+    )):
+        return "tool_technology"
+
+    if any(m in t for m in (
+        "iam", "least privilege", "encryption", "kms", "secrets manager", "waf",
+        "guardduty", "security group", "vpc security", "sast", "sca ", "container scanning",
+        "iac scanning", "secret scanning", "how would you secure", "how do you secure",
+        "security posture", "compliance requirements", "prompt injection defense",
+        "how would you protect", "vulnerability", "penetration test",
+    )):
+        return "security"
+
+    if any(m in t for m in (
+        "kubectl", "pod is", "pods are", "crashloopbackoff", "oomkilled", "kubernetes",
+        " eks ", "helm chart", "node pool", "hpa", "cluster autoscaler", "karpenter",
+        "irsa", "pod identity", "network policy", "ingress controller",
+    )):
+        return "kubernetes"
+
+    if any(m in t for m in (
+        "route 53", "route53", "cloudfront", "api gateway", "dynamodb", "elasticache",
+        " rds ", "lambda function", " s3 ", "ecs vs eks", "which aws service",
+        "aws service", "cloudformation",
+        # Added 2026-08-24: cost questions are the most common AWS interview topic
+        # and matched no AWS keyword at all ("how would you reduce our AWS bill?"
+        # classified as default, "how do you optimize AWS cost?" as tool_technology).
+        "aws cost", "aws bill", "cloud cost", "cost optimi", "reduce cost",
+        "reduce our cost", "reduce the cost", "cost reduction", "finops",
+        "reserved instance", "savings plan", "rightsiz",
+        "failover", "read replica", "multi-az", "aurora",
+    )):
+        return "aws"
+
+    if any(m in t for m in (
+        "ci/cd", "cicd", "pipeline failure", "deployment pipeline", "terraform state",
+        "manage terraform", "blue/green", "canary deploy", "rolling deploy",
+        "artifact registry", "reduce deployment failures", "release pipeline",
+    )):
+        return "cicd_devops"
+
+    if any(m in t for m in (
+        "sli", "slo", "error budget", "mttr", "mttd", "reliability engineering",
+        "site reliability", "reduce mttr", "chaos engineering", "toil",
+    )):
+        return "sre"
+
+    if any(m in t for m in (
+        "telemetry", "observability platform", "monitoring platform", "opentelemetry",
+        "otel", "alert noise", "alert correlation", "log aggregation", "distributed trac",
+        "which telemetry", "observability stack", "monitoring stack",
+        "logging stack", "tracing stack", "observability strategy",
+    )):
+        return "observability"
+
+    if any(m in t for m in (
+        "aiops", "anomaly detection", "event correlation", "self-healing",
+        "closed-loop remediation", "closed loop remediation", "automated remediation",
+        "autonomous remediation", "intelligent alerting", "capacity forecasting",
+        "root-cause analysis platform",
+    )):
+        return "aiops"
 
     if any(m in t for m in (
         "bedrock", "claude", "anthropic", "retrieval augmented", "agentic",
@@ -55,384 +250,766 @@ def _classify_category(question_text: str) -> str:
         "fine-tun", "finetun", "vector database", "vector store", "embeddings",
         "guardrail", "langchain", "langgraph", "hallucinat", "prompt injection",
     )) or re.search(r"\b(rag|llm)\b", t):
-        return "ai_genai"
+        return "tool_technology" if t.strip().startswith(("what is", "what's", "how does")) else "architecture"
 
     if any(m in t for m in (
         "throwing errors", "is down", "isn't working", "not working", "debug",
         "diagnose", "troubleshoot", "incident", "outage", "root cause",
         "one of your production", "started failing",
-        "how would you resolve", "how would you fix", "pod is", "service is",
+        "how would you resolve", "how would you fix", "service is", "latency increased",
+        "alerts fired", "multiple services", "became unhealthy",
     )):
-        return "scenario"
+        return "scenario_troubleshooting"
 
     if any(m in t for m in (
-        "design a ", "design an ", "architect a ", "architect an ", "how would you build",
-        "build a system", "build a platform", "propose an architecture", "system design",
-        "design the architecture", "how would you architect",
-        # retrospective design-rationale questions ("why did you design/choose/build X") get
-        # the same headed structure as prospective ones -- the content shape is identical,
-        # just explaining a decision instead of proposing one
-        "why did you design", "why did you choose", "why did you build", "why did you go with",
-        "why did you use", "why two", "why not one", "why not a single",
-        # descriptive walkthrough of an existing system -- "walk me through the architecture"
-        # is one of the most natural interview phrasings and was falling through to default
-        "walk me through the architecture", "walk me through your architecture",
-        "walk me through the complete architecture", "walk me through the system",
-        "explain the architecture", "overview of the architecture", "overview of your architecture",
+        # "how do " deliberately REMOVED. Measured 2026-08-24: it matched "how do you
+        # mentor junior engineers?" and "how do you handle a disagreement with a senior
+        # stakeholder?" -- routing people questions to a template whose opening heading is
+        # "## What Is It" and whose body explains "what problem it solves / how it works".
+        # "How do you X" is the single most common interview phrasing there is, so a bare
+        # substring match on it swallows most of the other categories (4 of 8
+        # misclassifications in a 22-question audit traced to this one entry).
+        # "how does " is kept -- that IS definitional ("how does Terraform state work").
+        "what is ", "what's ", "what are ", "how does ", "explain what",
     )):
-        return "architecture"
+        return "tool_technology"
 
     return "default"
 
 
 _SHARED_FORMATTING_MECHANICS = (
     "STRICT LIVE-INTERVIEW ANSWER FORMAT -- OVERRIDES EVERY OTHER FORMATTING INSTINCT.\n"
-    "The candidate reads this off an overlay DURING a live interview and speaks it. They "
-    "must be able to glance for 2-3 seconds and instantly know what to say next.\n"
-    "  NEVER produce a wall of text. NEVER produce flowing paragraphs. NEVER combine "
-    "multiple ideas into one paragraph.\n"
-    "  ABSOLUTE RULE -- EVERY SECTION EXCEPT 'Direct Answer' AND 'Closing' IS BULLETS. Not "
-    "one of them is a paragraph. 'Why This Approach', 'Trade-offs', 'Example' and every "
-    "other section are bulleted lists, one idea per bullet, maximum two sentences per "
-    "bullet. If a draft has a section written as a paragraph, convert it to bullets before "
-    "returning. A paragraph anywhere except the opening Direct Answer is a formatting "
-    "failure, no matter how good the content is.\n"
-    "  BOLD is permitted in exactly ONE place: the short label at the start of a bullet, "
-    "before the dash. Never bold anything inside a sentence, never bold a whole sentence, "
-    "never bold in the Direct Answer or Closing.\n\n"
-    "REQUIRED STRUCTURE (use the section names as plain '## ' headings; skip sections that "
-    "genuinely do not apply to the question):\n"
-    "  ## Direct Answer\n"
-    "    One or two short sentences the candidate can say immediately, stating the position.\n"
-    "  ## My Approach\n"
-    "    4-6 bullets. Each bullet is: short label, then ' - ', then ONE complete speakable "
-    "sentence explaining it. Example of the exact shape required:\n"
-    "      - Dependency first - Before correlating two anomalies, I verify there is an "
-    "actual dependency between the services.\n"
-    "      - Trace evidence - I use distributed traces to prove request propagation rather "
-    "than assuming causality from timestamps.\n"
-    "      - Change correlation - I check deployments and infrastructure changes before "
-    "declaring one service the root cause.\n"
-    "      - Directionality - I verify which anomaly occurred first to avoid reversing "
-    "cause and effect.\n"
-    "    NEVER write keyword-only bullets like 'Dependency -> Trace -> Timing'. NEVER write "
-    "a bullet the candidate has to turn into a sentence themselves.\n"
-    "  ## Flow  (only when a process or decision genuinely branches)\n"
-    "    A compact single-column ASCII flow in a fenced block, then one short bullet per "
-    "step. Keep every line under 32 characters, top-to-bottom, never side-by-side.\n"
-    "  ## Why This Approach\n"
-    "    BULLETS ONLY -- this section is repeatedly written as a paragraph by mistake. Use "
-    "exactly this shape:\n"
-    "      - Why I chose it - <one sentence>\n"
-    "      - What it solves - <one sentence>\n"
-    "      - At enterprise scale - <one sentence>\n"
-    "      - Cost of getting it wrong - <one sentence>\n"
-    "  ## Trade-offs\n"
-    "    Bullets: the advantage, the real limitation, the operational cost, the money cost.\n"
-    "  ## Why X, not Y  (only when a technology choice is genuinely in play)\n"
-    "    'Why I chose X' with 2-3 bullets, then 'Why not Y' with the reason and trade-off.\n"
-    "  ## Example\n"
-    "    BULLETS ONLY -- also repeatedly written as a paragraph by mistake. Walk the "
-    "example as discrete steps, one per bullet:\n"
-    "      - Symptom - <what was seen>\n"
-    "      - Wrong move - <what a team would naively do>\n"
-    "      - What I'd do - <the actual check>\n"
-    "      - Real cause - <what it turned out to be>\n"
-    "  ## Closing\n"
-    "    ONE strong principal-architect sentence to finish on.\n"
-    "  ## If They Ask Further\n"
-    "    3-5 bullets of extra depth, held in reserve. Put additional detail HERE rather "
-    "than inflating the main answer.\n\n"
-    "LENGTH -- STRICT. A normal question is 30-60 SECONDS of speaking content. A deep "
-    "architecture question is 1-3 minutes. NEVER produce a 5-10 minute answer. If there is "
-    "more to say, it belongs under 'If They Ask Further', not in the main body.\n\n"
-    "DEPTH IS UNEVEN ON PURPOSE. Do not give every bullet equal weight. Spend the detail on "
-    "the architectural decisions and the trade-offs; compress the routine parts to one line.\n\n"
-    "SPEAKING STYLE. Use: 'I would...', 'My approach would be...', 'The reason I prefer "
-    "this is...', 'The trade-off here is...', 'In production, I would...', 'I wouldn't...', "
-    "'The important point is...'. Avoid: 'According to the definition...', 'It is important "
-    "to note that...', 'OpenTelemetry is a framework that...', and any long theoretical "
-    "run-up. Sound like a senior architect talking, never like documentation.\n\n"
-    "  - CODE / COMMANDS: fenced block, never inline in a sentence.\n"
+    "*** THE CANDIDATE READS THIS ANSWER OUT LOUD, WORD FOR WORD. *** This is the single "
+    "most important fact about the format. It is NOT an outline they elaborate from -- they "
+    "speak the words on the screen. Corrected 2026-08-25 after live use: the previous "
+    "'terse speaking prompt' style produced telegraphic fragments like 'Implementation "
+    "owner for technical control families -- AC, AU, CM, SC, SI -- that sit in "
+    "infrastructure and platform code' which are physically unspeakable, and the candidate "
+    "could not use them in a real interview.\n\n"
+    "EVERY BULLET MUST BE A COMPLETE, NATURAL, SPEAKABLE SENTENCE. Read each bullet back to "
+    "yourself as if saying it out loud to an interviewer. If it would sound like someone "
+    "reciting a spec sheet, rewrite it as a sentence. Specifically:\n"
+    "  - Write in first person with a real verb: 'I own the...', 'I'd start by...', 'The "
+    "failure mode I watch for is...'. A bullet with no verb is wrong.\n"
+    "  - Do NOT chain fragments with ' -- ' as a substitute for grammar. One or two dashes "
+    "for a genuine aside is fine; three dash-separated fragments in a row is not a sentence.\n"
+    "  - Spell out an acronym the first time it appears if reading the letters aloud would "
+    "sound stilted: write 'the access control and audit families' rather than 'AC, AU'. "
+    "Well-known ones (AWS, IAM, EKS, KMS, CI/CD, TLS, SSO) can stay as-is.\n"
+    "  - Keep each bullet to roughly one spoken breath -- about 15 to 30 words. Two short "
+    "sentences in one bullet is acceptable; a 60-word run-on is not.\n"
+    "RIGHT: * I own the implementation of the technical control families -- access control, "
+    "audit, configuration management -- because those live in infrastructure and platform "
+    "code rather than in policy documents.\n"
+    "WRONG: * Implementation owner for technical control families -- AC, AU, CM, SC, SI -- "
+    "that sit in infrastructure and platform code, not policy narrative\n"
+    "RIGHT: * I put the credential-gathering agent on the higher-reasoning model, because "
+    "misidentifying a customer is the expensive failure here.\n"
+    "WRONG: * Credential Agent -- Sonnet 4 -- identity verification, PII extraction\n"
+    "Nested sub-bullets (indented, using '   *') are still fine for breaking something into "
+    "parts, but each sub-bullet is also a speakable sentence.\n"
+    "  NEVER produce an unbroken wall of text -- the structure below still matters for "
+    "scanning. The change is to the CONTENT of each bullet (now a real sentence), not to "
+    "the use of headings and bullets.\n"
+    "  BOLD sparingly -- section headings, and at most a couple of genuinely key terms per "
+    "answer. Heavy bolding across every bullet makes the overlay harder to read at a "
+    "glance, not easier.\n\n"
+    "THREE LAYERS OF DEPTH -- scale them to the question, do not dump all three on a "
+    "simple one. LAYER 1 is the direct answer, stated immediately. LAYER 2 is architecture "
+    "thinking -- why, how, the trade-off, the risk. LAYER 3 is production thinking -- "
+    "failure modes, security, scale, cost, operations, recovery. A definition question gets "
+    "layer 1 plus a touch of 2. An architecture question gets all three.\n\n"
+    "BE DECISIVE -- NEVER OVER-QUALIFY. Do not hedge with 'maybe', 'I think', 'possibly', "
+    "'it might be', or a bare 'it depends'. A 14-year architect states a position. When "
+    "there genuinely are two valid choices, say so and then PICK ONE: 'There are two "
+    "reasonable approaches here; for this requirement I'd choose X because...'. Never leave "
+    "the interviewer without a recommendation.\n\n"
+    "WHEN THE TECHNOLOGY IS NOT IN THE PERSONAL TRACK RECORD -- never say 'I haven't used "
+    "it' or 'I'm not familiar'. Shift into design voice and answer with full authority: "
+    "'From an architecture perspective, I'd approach it this way...', 'If I were designing "
+    "this today, I'd...', 'The way I'd implement this is...'. Cover what problem it solves, "
+    "where it fits, how it integrates, security, HA, scale, cost, operational model and "
+    "alternatives. Where it genuinely helps credibility you may add 'I'd validate the "
+    "specific implementation details in a POC, but architecturally I'd approach it this "
+    "way'. This demonstrates depth WITHOUT claiming hands-on experience that was never "
+    "provided -- both halves of that matter.\n\n"
+    "ARCHITECT SIGNALS -- use this vocabulary where it genuinely applies, never forced: "
+    "blast radius, trust boundary, failure domain, single point of failure, graceful "
+    "degradation, fail closed vs fail open, idempotency, backpressure, circuit breaker, "
+    "retry with exponential backoff, rate limiting, least privilege, defense in depth, "
+    "separation of duties, immutable infrastructure, shift-left security, error budget, "
+    "SLO/SLA, RTO/RPO, cost governance, auditability. One or two land as senior; stuffing "
+    "in ten reads as buzzword bingo.\n\n"
+    "NO META COMMENTARY. Never state the question type, never name the template or "
+    "structure being used, never say 'this is a scenario question' or 'using the STAR "
+    "format'. The interviewer hears only the answer.\n\n"
+    "SPECIFICITY TEST -- THE SINGLE BIGGEST QUALITY FAILURE. Judged in live review\n"
+    "2026-08-25: an answer about FedRAMP responsibilities was rejected as 'too generic'\n"
+    "because it talked about target-state architecture, roadmap, cross-team\n"
+    "collaboration, governance, Terraform standards and change control -- all true, all\n"
+    "senior-sounding, but it never demonstrated FedRAMP-SPECIFIC KNOWLEDGE. Apply this\n"
+    "test to EVERY answer before finishing it: could a competent generalist who has never\n"
+    "worked in this specific domain have written this? If yes, it is too generic and it\n"
+    "will read as bluffing to anyone who knows the subject.\n"
+    "  - NAME THE ACTUAL THINGS. Use the domain's real vocabulary: the specific standard,\n"
+    "control family, artefact, protocol, service, failure mode, metric or command. Say\n"
+    "'authorization boundary', 'POA&M', 'continuous monitoring', '3PAO', 'shared\n"
+    "responsibility' for FedRAMP; 'PodDisruptionBudget', 'CrashLoopBackOff', 'admission\n"
+    "controller' for Kubernetes; 'Multi-AZ failover', 'read replica lag', 'RDS Proxy'\n"
+    "for databases; 'label cardinality', 'chunk storage', 'exemplars' for Loki/Tempo.\n"
+    "  - Generic senior framing (trade-offs, failure modes, ownership, governance,\n"
+    "automation, collaboration) is NECESSARY BUT NOT SUFFICIENT. Keep it -- it is what\n"
+    "makes the answer principal-level rather than task-level -- but WRAP IT AROUND the\n"
+    "domain specifics rather than substituting it for them.\n"
+    "  - When the question asks what YOUR responsibility is for something, walk the\n"
+    "actual end-to-end chain of that domain in order, naming each step, rather than\n"
+    "describing your ways of working in the abstract.\n\n"
+    "HEADERS ARE MANDATORY NAVIGATION -- use plain '## ' headings, one per logical chunk, "
+    "named for what that chunk covers (not a generic 'Section 1'). The candidate's eye "
+    "jumps to a heading, they know instantly what that chunk covers, then reads the "
+    "sentences beneath it aloud. The exact heading set and order is defined per "
+    "question-type category below -- follow that category's structure, not a generic "
+    "one-size-fits-all list. Skip a section from that category's list only if it genuinely "
+    "does not apply to this specific question; do not invent extra sections.\n"
+    "  THE FIRST HEADING IS MANDATORY AND EXACT -- whatever heading name the category shape "
+    "below designates as the opening section, that heading is ALWAYS the literal first line "
+    "of the answer, no prose before it, never omitted, never replaced with a restated-"
+    "question title ('## AKS vs EKS for an Enterprise PaaS' is wrong -- use the designated "
+    "opener heading instead, e.g. '## Brief Context' or '## Requirements').\n\n"
+    "FLOW / ARCHITECTURE DIAGRAMS -- when a category shape calls for one, use a compact "
+    "ASCII flow in a fenced code block. Branching is fine when the real architecture "
+    "branches (parallel components converging back together, decision forks) -- do not "
+    "force everything into a single top-to-bottom column if the real flow genuinely splits "
+    "and rejoins. Keep it glanceable: short labels, no more than a few words per box.\n\n"
+    "TOOLS / TECHNOLOGIES -- name the real tool or service explicitly wherever one is used, "
+    "in the terse 'Tool -- purpose' shape (e.g. 'Prometheus -- metrics', 'Terraform -- "
+    "IaC'). Only name tools genuinely relevant to this question -- do not list tools to "
+    "pad the answer or make it look more technical.\n\n"
+    "LENGTH -- STRICT. Because bullets are now terse rather than full sentences, a section "
+    "can carry more bullets than before without becoming a 5-10 minute answer -- but the "
+    "total should still be something the candidate can glance through and speak from in "
+    "60-90 seconds for a normal question, 2-4 minutes for a deep architecture question. If "
+    "there's more depth to offer, it belongs in a reserve/follow-up section (where the "
+    "category shape provides one), not padding out the main body.\n\n"
+    "DEPTH IS UNEVEN ON PURPOSE. Do not give every section or bullet equal weight. Spend "
+    "more bullets, and nested sub-bullets, on the decisions and trade-offs that actually "
+    "matter; compress routine/expected parts to a single bullet or skip the section "
+    "entirely.\n\n"
+    "  - CODE / COMMANDS: fenced block, never inline in a bullet.\n"
     "  - TABLES: only for genuine side-by-side comparison, 3-4 columns max, short cells.\n\n"
 )
 
 _CATEGORY_SHAPES: dict[str, str] = {
-    "comparison": (
-        "QUESTION SHAPE: COMPARISON. Structure as:\n"
-        "  ## Recommendation -- lead with your actual pick and the one-line reason, before "
-        "the comparison itself. A comparison with no opinion at the end is not an answer.\n"
-        "  ## Comparison Table -- a markdown table, one row per dimension that genuinely "
-        "differentiates the options for THIS context (e.g. latency, cost, operational "
-        "complexity, lock-in) -- not a generic checklist, and not a row that says the same "
-        "thing on both sides.\n"
-        "  ## When each wins -- 1-2 sentences per option, concrete conditions, not a restate "
-        "of the table.\n"
-        "Skip any dimension or section that doesn't add real differentiation for this "
-        "specific question.\n\n"
+    # --- Categories added 2026-08-25 from the candidate's interview-copilot spec ---
+    "definition": (
+        "QUESTION SHAPE: DEFINITION / CONCEPT ('what is RAG?', 'what is a service mesh?', "
+        "'what is OpenTelemetry?'). STRUCTURALLY SHORT, not word-count-limited-by-"
+        "instruction -- headings and bullets for a one-line definition just invite padding "
+        "to fill them (measured 2026-08-25: this category still ran long even under an "
+        "explicit 180-word cap). NO heading. NO bullets. Exactly THREE sentences, flowing "
+        "as one short spoken paragraph, in this order: (1) what it is, in plain language, "
+        "(2) why it matters / what problem it solves, from your own architectural "
+        "perspective, (3) one concrete example of where you'd actually use it. Nothing "
+        "else -- no 'Direct Answer' framing, no extra sections, no closing line. Target "
+        "50-80 words total. Example of the exact shape (do not reuse this content, match "
+        "the FORM): \"OpenTelemetry is a vendor-neutral observability framework for "
+        "collecting metrics, logs and distributed traces. From an architecture "
+        "perspective, I use it to standardize telemetry across services and avoid tight "
+        "coupling to one observability vendor. For example, services running on EKS can "
+        "send traces and metrics through an OTel Collector to Datadog, Prometheus or "
+        "another supported backend without changing application code.\" If the "
+        "interviewer wants more, they will ask a follow-up -- that follow-up gets its own "
+        "category and its own depth, this one does not. Target 60-90 words -- measured "
+        "2026-08-25: even the 3-sentence structure still ran to 104-127 words with an "
+        "80-word target stated mid-prompt, so treat 90 words as a hard ceiling you check "
+        "before finishing, not a rough aim. Each of the 3 sentences should be one clause, "
+        "not two stacked together with an em-dash.\n"
+    ),
+    "migration": (
+        "QUESTION SHAPE: MIGRATION ('how would you migrate Jenkins to GitHub Actions?', "
+        "'EC2 to EKS?'). Every bullet a complete, speakable sentence. The whole point is "
+        "showing how PRODUCTION RISK IS CONTROLLED, not listing steps. Opening heading is "
+        "exactly '## Current State':\n"
+        "  ## Current State\n"
+        "  ## Target State\n"
+        "  ## Gap Analysis\n"
+        "    * What actually differs, and which gaps are risky versus trivial.\n"
+        "  ## Migration Strategy\n"
+        "    * Pilot first, then parallel run, then incremental cutover -- never big-bang. "
+        "Say why explicitly.\n"
+        "  ## Validation And Cutover\n"
+        "    * How you prove the new path is correct before traffic moves.\n"
+        "  ## Rollback\n"
+        "    * The rollback plan, and the point of no return.\n"
+        "  ## Decommission\n"
+        "  ## Key Trade-offs\n"
+    ),
+    "scalability": (
+        "QUESTION SHAPE: SCALABILITY / PERFORMANCE ('how would you scale this to 10x?'). "
+        "NEVER answer with 'scale horizontally' alone -- identify the actual bottleneck "
+        "first. Every bullet a complete, speakable sentence. Opening heading is exactly "
+        "'## Current Load And Growth':\n"
+        "  ## Current Load And Growth\n"
+        "  ## Where The Bottleneck Actually Is\n"
+        "    * Name it specifically -- connection pool, single writer, cardinality, lock "
+        "contention, network egress -- not 'the servers'.\n"
+        "  ## Scaling Strategy\n"
+        "    * Horizontal vs vertical, caching, async/queueing, partitioning/sharding, "
+        "read replicas, rate limiting and backpressure -- only the ones that address the "
+        "bottleneck named above.\n"
+        "  ## Capacity Planning And Load Testing\n"
+        "  ## Cost Impact\n"
+        "    * Scaling always costs something; say what.\n"
+        "  ## Trade-offs\n"
+    ),
+    "ha_dr": (
+        "QUESTION SHAPE: HIGH AVAILABILITY / DISASTER RECOVERY. Every bullet a complete, "
+        "speakable sentence. You MUST explicitly answer both 'what happens if this "
+        "component fails' AND 'what happens if the entire region fails'. Opening heading is "
+        "exactly '## Availability Requirement':\n"
+        "  ## Availability Requirement\n"
+        "    * State the target and the RTO/RPO being designed to -- everything else "
+        "follows from these two numbers.\n"
+        "  ## Failure Domains\n"
+        "    * Instance, AZ, region, dependency, and which ones this design tolerates.\n"
+        "  ## Multi-AZ Design\n"
+        "  ## Multi-Region And Data Replication\n"
+        "    * Synchronous vs asynchronous, and the RPO consequence of each.\n"
+        "  ## Failover And Backup\n"
+        "    * Automatic or manual, how long it takes, and how it is tested.\n"
+        "  ## What Happens When It Fails\n"
+        "    * Component failure first, then full region loss. Be concrete.\n"
+        "  ## Trade-offs\n"
+        "    * Active-active vs active-passive, cost vs RTO. Make a recommendation.\n"
+    ),
+    "cost_finops": (
+        "QUESTION SHAPE: COST / FINOPS. Never answer 'use cheaper resources'. Every bullet "
+        "a complete, speakable sentence. Opening heading is exactly '## Cost Drivers':\n"
+        "  ## Cost Drivers\n"
+        "    * Where the money actually goes -- compute, storage, data transfer, "
+        "observability, database, licensing -- roughly in order of size.\n"
+        "  ## Visibility First\n"
+        "    * Tagging discipline and per-service attribution, because you cannot optimize "
+        "what you cannot attribute.\n"
+        "  ## Optimization Levers\n"
+        "    * Rightsizing, reserved capacity and savings plans, lifecycle policies, "
+        "non-prod scheduling, orphaned-resource cleanup, egress reduction.\n"
+        "  ## Governance And Guardrails\n"
+        "    * Budgets, anomaly detection, showback, and policy enforced at provisioning "
+        "time rather than discovered on the invoice.\n"
+        "  ## Trade-offs\n"
+        "    * Cost against reliability, performance and operational effort. Say what you "
+        "would NOT cut.\n"
+    ),
+    "failure_negative": (
+        "QUESTION SHAPE: FAILURE / NEGATIVE SCENARIO ('what if X fails?', 'what if the "
+        "region goes down?'). Every bullet a complete, speakable sentence. Opening heading "
+        "is exactly '## Detection':\n"
+        "  ## Detection\n"
+        "    * How you find out, and how fast.\n"
+        "  ## Blast Radius\n"
+        "    * Exactly who and what is affected.\n"
+        "  ## What Keeps Working\n"
+        "    * The graceful-degradation story -- what continues, what degrades, what fails "
+        "closed and what fails open. For anything security-sensitive, state plainly that "
+        "it fails CLOSED.\n"
+        "  ## Fallback And Recovery\n"
+        "    * The manual fallback path, and how you recover.\n"
+        "  ## Validation\n"
+        "    * How you confirm recovery actually happened rather than trusting a success "
+        "response.\n"
+        "  ## Prevention\n"
+    ),
+    "why_not": (
+        "QUESTION SHAPE: 'WHY NOT X?' CHALLENGE ('why not Kubernetes?', 'why not just buy "
+        "a product?'). Never rubbish the alternative -- that reads as defensive. Every "
+        "bullet a complete, speakable sentence. Opening heading is exactly '## Where That "
+        "Option Is Genuinely Strong':\n"
+        "  ## Where That Option Is Genuinely Strong\n"
+        "    * Give it real credit first. This is what makes the rest credible.\n"
+        "  ## Why It Doesn't Fit This Requirement\n"
+        "    * The specific constraint that rules it out -- not a generic criticism.\n"
+        "  ## What I'd Choose Instead And Why\n"
+        "  ## The Trade-off I'm Accepting\n"
+        "    * Every choice costs something. Name it.\n"
+        "  ## When I Would Choose The Alternative\n"
+        "    * Be concrete about the conditions that would flip the decision.\n"
+    ),
+    "behavioral": (
+        "QUESTION SHAPE: BEHAVIORAL ('tell me about a time...'). Architect-level STAR, not "
+        "developer-level. Every bullet a complete, speakable sentence. Opening heading is "
+        "exactly '## Situation':\n"
+        "  ## Situation\n"
+        "  ## What I Was Responsible For\n"
+        "    * The technical AND business responsibility, not just the task.\n"
+        "  ## What I Did\n"
+        "    * The architecture decision and the leadership action, including the "
+        "trade-off consciously accepted and how stakeholders were brought along.\n"
+        "  ## Result\n"
+        "    * Concrete outcome. Use a real number ONLY if it is in the grounding.\n"
+        "  ## What I'd Do Differently\n"
+        "    * One honest lesson. This is what makes it senior rather than a highlight "
+        "reel.\n"
+    ),
+    "project_ownership": (
+        "QUESTION SHAPE: PROJECT / OWNERSHIP ('what was your biggest project?', 'walk me "
+        "through something you owned'). Be precise about what YOU owned versus what the "
+        "team built. Every bullet a complete, speakable sentence. Opening heading is "
+        "exactly '## The Problem':\n"
+        "  ## The Problem\n"
+        "    * The business problem, not the technology.\n"
+        "  ## What I Owned\n"
+        "    * Explicitly distinguish what you personally designed and decided from what "
+        "the team implemented. Never blur this -- interviewers probe it.\n"
+        "  ## The Architecture\n"
+        "  ## The Hard Decisions\n"
+        "    * The two or three genuinely contested calls and how you made them.\n"
+        "  ## Outcome\n"
+        "  ## What I Learned\n"
+    ),
+    "trade_off": (
+        "QUESTION SHAPE: TRADE-OFF / COMPARISON. Every bullet a complete, speakable sentence. Opening heading is exactly '## Requirement':\n"
+        "  ## Requirement\n"
+        "    * What actually matters for this decision (1-2 terse fragments)\n"
+        "  ## Option A -- <name>\n"
+        "    * Advantages (bullets)\n"
+        "    * Disadvantages (bullets)\n"
+        "  ## Option B -- <name>\n"
+        "    * Advantages (bullets)\n"
+        "    * Disadvantages (bullets)\n"
+        "  ## Decision Criteria\n"
+        "    * Scale / Cost / Complexity / Reliability / Team expertise / Security -- only "
+        "the dimensions that genuinely differentiate for THIS question, not a generic "
+        "checklist.\n"
+        "  ## Recommendation\n"
+        "    * Which one, and the one-line reason why. A comparison with no pick at the end "
+        "is not an answer.\n\n"
     ),
     "leadership": (
-        "QUESTION SHAPE: BEHAVIORAL / LEADERSHIP. Structure as STAR, using ONLY the real "
-        "incident and real facts in your grounding -- never invent a different story, "
-        "employer, team or metric to fit the question:\n"
-        "  ## Situation -- 1-2 sentences, real context.\n"
-        "  ## Task -- what you specifically were responsible for.\n"
-        "  ## Action -- what you actually did, first person, the bulk of the answer.\n"
-        "  ## Result -- the real, honest outcome, including an honest limitation if that's "
-        "the truth (e.g. 'we couldn't fix the regional outage directly, so the work was...').\n"
-        "  ## Lesson -- what it changed about how you work now.\n"
+        "QUESTION SHAPE: BEHAVIORAL / LEADERSHIP. Speakable full-sentence bullets under each heading, using "
+        "ONLY the real incident and real facts in your grounding -- never invent a "
+        "different story, employer, team or metric to fit the question. Opening heading is "
+        "exactly '## Situation':\n"
+        "  ## Situation\n"
+        "    * Real context, terse (1-2 bullets)\n"
+        "  ## Challenge\n"
+        "    * The technical/organizational challenge\n"
+        "  ## My Role\n"
+        "    * What you personally owned\n"
+        "  ## Decision\n"
+        "    * Options considered, trade-offs\n"
+        "  ## Leadership\n"
+        "    * Stakeholders, influence, conflict resolution -- only if genuinely part of "
+        "the real story\n"
+        "  ## Execution\n"
+        "    * What actually happened, terse steps\n"
+        "  ## Result\n"
+        "    * The real, honest outcome -- including an honest limitation if that's the "
+        "truth\n"
+        "  ## Learning\n"
+        "    * What changed about how you work now\n"
         "If your grounding has no real story that fits this specific prompt, say so plainly "
         "and pivot to the closest real experience you do have, framed transparently as an "
         "adjacent example -- never fabricate a different incident to fit better.\n\n"
     ),
-    "ai_genai": (
-        "QUESTION SHAPE: AI / GENAI ARCHITECTURE. Structure as:\n"
-        "  ## Executive Summary -- 2-3 sentences, the actual position or design choice.\n"
-        "  ## Workflow -- a compact ASCII flow diagram (see FORMATTING MECHANICS) of the "
-        "request path -- user, stages, response -- marking where guardrails/HITL gates sit. "
-        "ONLY if the question is genuinely architectural; skip entirely for a pure "
-        "conceptual question like 'what is RAG'.\n"
-        "  ## Key Components -- bullets, only the pieces that matter for this question.\n"
-        "  ## Guardrails & Safety -- only if the question touches production/enterprise use.\n"
-        "  ## Cost / Production Considerations -- only if genuinely relevant.\n"
-        "Skip any section that doesn't add real value for this specific question -- a simple "
-        "definitional question needs none of the diagram/guardrails/cost sections, just a "
-        "clear, well-grounded explanation.\n\n"
-        "SUB-CASE: TELEMETRY / OBSERVABILITY FOR A RAG OR AGENTIC AI SYSTEM (e.g. 'which "
-        "telemetry would you capture for a production RAG/agentic system') -- this is a "
-        "DESIGN RECOMMENDATION question ('what would you capture/build'), not a claim about "
-        "an existing deployed system, so speak in 'I would' / 'I'd design this as' voice "
-        "throughout -- confident and specific, no hands-on hedging needed, because "
-        "recommending an architecture is not the same claim as having personally operated "
-        "it (see VOICE TENSE FOR DESIGN RECOMMENDATIONS below). Structure across four "
-        "dimensions, each with concrete fields, not just category names:\n"
-        "  1. TRADITIONAL SYSTEM HEALTH -- CPU/memory/GPU utilization, pod restarts, queue "
-        "depth, model-serving latency, infra saturation -- the standard platform telemetry "
-        "underneath the AI system.\n"
-        "  2. AI EXECUTION -- end-to-end distributed trace per request (OpenTelemetry as the "
-        "standard layer, one trace from API gateway through retrieval, vector DB, reranker, "
-        "LLM call, agent decision, tool call, to response). Retrieval telemetry: embedding "
-        "latency, vector DB latency, top-K, retrieved document IDs, relevance/rerank scores, "
-        "retrieval failures/fallback rate (hybrid vector+keyword fallback rate specifically, "
-        "since pure semantic search misses exact strings). LLM telemetry: model name/version, "
-        "input/output/total tokens, latency, time-to-first-token, throughput, errors, "
-        "retries, finish_reason -- token telemetry doubles as AI FinOps data (cost per "
-        "request/customer/model/workflow). Agent telemetry: agent name/version, workflow, "
-        "iteration count, tool call sequence, tool latency/failures/retries, decision "
-        "metadata -- specifically watch for loop signatures (same tool called repeatedly, "
-        "iteration count exceeding a threshold with no forward progress).\n"
-        "  3. AI QUALITY -- the layer traditional APM doesn't give you: retrieval relevance, "
-        "context relevance, groundedness, faithfulness (does every claim trace to a "
-        "retrieved source), hallucination indicators, task completion rate, user feedback. "
-        "The point: whether the AI produced a useful, trustworthy answer, not just whether "
-        "the API returned 200.\n"
-        "  4. BUSINESS / SECURITY OUTCOMES -- escalation rate and reason, human-resolution "
-        "outcome post-escalation, customer-impact metrics specific to the domain, cost per "
-        "interaction, and security telemetry: prompt injection attempts, PII detection, "
-        "unauthorized tool calls, policy violations, sensitive-data exposure.\n"
-        "Then name the architectural discipline point explicitly: don't blindly log raw "
-        "prompts/responses into the observability platform -- they carry sensitive data and "
-        "drive telemetry cost disproportionately; capture structured metadata by default, "
-        "redact/selectively capture raw content only where genuinely required. Close by "
-        "tying it back to AIOps: everything correlates via the trace context (OpenTelemetry "
-        "trace ID), feeding the same correlation/anomaly-detection/RCA pipeline as any other "
-        "production system, plus deployment/change-event correlation specific to AI systems "
-        "-- new model version, prompt version, RAG index update, embedding-model change -- "
-        "since 'what changed' is still the highest-yield RCA signal even when the system is "
-        "an LLM pipeline rather than a traditional service.\n\n"
+    "career_narrative": (
+        "QUESTION SHAPE: CAREER / EXPERIENCE NARRATIVE ('tell me about yourself', 'walk me "
+        "through your background').\n"
+        "*** THIS ONE IS READ ALOUD VERBATIM. WRITE SPOKEN PROSE, NOT BULLETS. *** The "
+        "candidate reads this answer out word for word, so resume-style fragments are "
+        "unusable: 'Application Developer (early career) -- Java, REST APIs, backend "
+        "services' cannot be spoken by a human. Observed live 2026-08-25 -- the bulleted "
+        "version read like a spec sheet being recited. Write COMPLETE, NATURAL, SPEAKABLE "
+        "SENTENCES in short paragraphs, first person, the way a senior architect actually "
+        "talks in the first two minutes of an interview. NO bullet characters anywhere in "
+        "this answer. NO section headings either -- headings break the flow of something "
+        "being spoken continuously.\n"
+        "LENGTH: HARD CEILING 260 words -- aim for 230. That is roughly 90-100 seconds "
+        "aloud, which is the right length for this question. Measured 2026-08-25: an "
+        "unconstrained version ran to 330 words / 2m20s, which is far too long to hold an "
+        "interviewer through an opening answer. Cut the least important sentence rather "
+        "than trimming every sentence into fragments.\n"
+        "ABSOLUTELY NO MARKDOWN HEADINGS in this answer -- not even one, not even '## Career "
+        "Arc'. A person speaking does not announce section titles. This overrides any "
+        "general instruction elsewhere about opening with a designated heading: for THIS "
+        "category the answer opens directly with the first spoken sentence.\n"
+        "NUMBERS: only the metrics explicitly listed in the persona's numbers-discipline "
+        "line may appear. Measured 2026-08-25: an answer invented 'billions of API calls "
+        "annually', which is not a real figure anywhere in the grounding. If a number is not "
+        "in the grounding, do not reach for one -- describe the scope in words instead.\n"
+        "SHAPE (as flowing paragraphs, not labelled sections):\n"
+        "  1. Open with total years and the honest distinction -- total years of experience "
+        "vs years specifically at architect level are DIFFERENT facts (e.g. '13+ years in "
+        "engineering, the last ~3 specifically as an architect'). Never collapse them or "
+        "imply the whole career was at architect level.\n"
+        "  2. One sentence on the early engineering years and why that background still "
+        "matters today (it is the reason you build platforms developers actually adopt).\n"
+        "  3. The DevOps/cloud chapter -- what you built, the stack, and TWO concrete "
+        "measured outcomes stated as plain numbers in speech.\n"
+        "  4. The current architect role -- scope, team size, what you own.\n"
+        "  5. The newest chapter, at a FUNCTIONAL level only -- what it does and why it "
+        "matters. NO model names, service names or tool counts here; that detail belongs to "
+        "a dedicated architecture follow-up, and reciting it makes this answer too long.\n"
+        "  6. Close by connecting the background to THIS role, using the responsibilities "
+        "THIS interview's job description actually names. Do NOT reuse a pitch written for a "
+        "different role -- if the JD is about cloud cost optimization, EKS, databases, "
+        "observability and compliance, say those, not a different role's themes.\n"
+        "Every fact must come from the real grounding -- never invent employers, metrics, "
+        "or projects to fill space. De-identify the real employer/project per the "
+        "DE-IDENTIFICATION rule elsewhere in this prompt.\n\n"
     ),
-    "scenario": (
-        "QUESTION SHAPE: SCENARIO / TROUBLESHOOTING. Structure as:\n"
-        "  ## Executive Summary -- 2-3 sentences: your actual approach in one breath.\n"
-        "  ## Troubleshooting Flow -- a compact ASCII decision-flow diagram (see FORMATTING "
-        "MECHANICS) ONLY if the process genuinely branches (e.g. node healthy? yes/no). If "
-        "it's a straight linear sequence, use a numbered list instead of a diagram.\n"
-        "  ## Commands -- a single fenced code block, only commands you'd actually run, "
-        "never inline in prose.\n"
-        "  ## Resolution -- how you'd actually fix it, briefly.\n"
-        "  ## Prevention -- only if there's a genuine follow-up action worth naming, not a "
-        "filler line.\n"
-        "Skip any section with nothing concrete to add.\n\n"
+    "tool_technology": (
+        "QUESTION SHAPE: TOOL / TECHNOLOGY ('what is X', 'how does X work', 'explain X'). "
+        "Complete speakable sentences throughout, third person where explaining the tool itself "
+        "(not personal narrative) -- but see QUESTION MODE elsewhere in this prompt for "
+        "when a variant of this question is actually asking about YOUR experience with the "
+        "tool instead, which changes voice. Opening heading is exactly '## What Is It':\n"
+        "  ## What Is It\n"
+        "    * One-line definition, terse\n"
+        "  ## Why\n"
+        "    * The problem it solves\n"
+        "  ## How It Works\n"
+        "    * Key concepts, terse fragments\n"
+        "    * Internal flow if relevant\n"
+        "  ## Components\n"
+        "    * Component 1 -- role\n"
+        "    * Component 2 -- role\n"
+        "  ## Example\n"
+        "    * A real production use case, concrete\n"
+        "  ## When To Use\n"
+        "    * Scenario 1\n"
+        "    * Scenario 2\n"
+        "  ## When NOT To Use\n"
+        "    * Scenario 1\n"
+        "    * Scenario 2\n"
+        "  ## Advantages\n"
+        "    * Point 1 / Point 2 / Point 3, terse\n"
+        "  ## Limitations / Trade-offs\n"
+        "    * Point 1 / Point 2, terse\n"
+        "  ## Related Tools\n"
+        "    * Only if genuinely useful context -- Tool A / Tool B\n"
+        "Skip any section that doesn't add real value for a simple version of this "
+        "question -- a quick definitional ask doesn't need all 9 sections.\n\n"
     ),
-        "architecture": (
-        "QUESTION SHAPE: ARCHITECTURE / SYSTEM DESIGN -- covers three sub-cases with headers "
-        "as navigation aids for the reader's eyes. NOTE: every bullet under these headings must "
-        "still be a complete speakable sentence per the LIVE READING CONSTRAINT: "
-        "the candidate glances at each heading, knows what that chunk covers, and speaks "
-        "about it in their own words -- so headers are genuinely useful here, unlike a "
-        "verbatim script where a heading would sound stilted if read aloud.\n"
-        "  A) PROSPECTIVE ('design a system for X') -- you're proposing a new design for THIS "
-        "interviewer's hypothetical, not describing your current employer's environment as if "
-        "it were a given fact of their question:\n"
-        "     ## Assumptions -- 1-2 sentences stating the scale/constraints you're assuming, "
-        "since the question is under-specified. If you ground that assumption in a real number "
-        "from your own experience (e.g. account count, team size), ATTRIBUTE it explicitly -- "
-        "'I'll assume a scale similar to what I manage today, around 160 accounts' -- never "
-        "just state 'across 160 accounts' as if that were a given fact of THIS hypothetical "
-        "scenario. The interviewer didn't say their platform has that scale; stating a real "
-        "number unattributed reads as presuming facts about their environment instead of "
-        "citing your own experience as the reasoning behind the assumption.\n"
-        "     ## Architecture -- a compact ASCII diagram (see FORMATTING MECHANICS).\n"
-        "     ## Key Decisions -- bullets, the 3-5 choices that matter, each with a reason.\n"
-        "     ## Trade-offs -- what you gave up, stated honestly.\n"
-        "  B) RETROSPECTIVE RATIONALE ('why did you design/choose/build X this way') -- "
-        "you're explaining a decision on something you actually built, first person, as "
-        "something you DID, never 'if I were designing this I would...':\n"
-        "     ## The core reason -- 1-2 sentences, the actual driving factor (cost, risk, "
-        "latency, blast radius -- whatever genuinely drove it). You may name the underlying "
-        "engineering principle in one clause if it's genuinely the reason, without lecturing "
-        "on it.\n"
-        "     ## Key Decisions -- short headers or bold lead-ins naming each real decision "
-        "(e.g. 'the model split', 'the handoff mechanism'), each explained in 2-4 sentences. "
-        "NEVER restate the interviewer's implicit sub-question verbatim as the header ('Why "
-        "use Claude Sonnet?') -- name the DECISION instead ('Sonnet for identity, Haiku for "
-        "fulfillment'). Pick 2-3 decisions that actually mattered, not an exhaustive list.\n"
-        "     ## Trade-off -- what you gave up by choosing this over the alternative.\n"
-        "     Optionally close with ONE sentence on how you'd extend the design further, "
-        "only if it's a genuine next step, not padding.\n"
-        "  C) DESCRIPTIVE WALKTHROUGH ('walk me through the architecture', 'explain how this "
-        "system works') -- a full end-to-end tour of something you built, first person. This "
-        "is the richest, most thorough sub-case -- go deep, this is where the interviewer "
-        "wants substance:\n"
-        "     Optionally open with ONE substantive sequencing sentence -- 'Before the "
-        "architecture, the business problem matters, because every decision here followed "
-        "from it' -- then the business problem in a short paragraph, before the technical "
-        "walkthrough. This is not empty preamble; it's establishing that decisions were "
-        "business-driven, which is itself a senior signal.\n"
-        "     ## Overview -- the core constraint that shaped the design.\n"
-        "     Structure the technical walkthrough as a small number of NAMED LOGICAL LAYERS "
-        "or stages (e.g. 'divided into five layers: Channel Orchestration, Identity "
-        "Verification, Business Orchestration, Enterprise Integration, Human Assistance') -- "
-        "this framing device makes a complex system easy to follow and signals architectural "
-        "thinking, not just a feature list. One '##' heading per layer, named for what it "
-        "does, each with real depth: what it does, why it exists, what would break without "
-        "it, and where relevant, why a specific tool/model/service was chosen there.\n"
-        "     ## [end-to-end flow diagram] -- a compact ASCII diagram (see FORMATTING "
-        "MECHANICS) showing the request path start to finish, under its own real heading "
-        "naming what it shows (e.g. '## Request Flow'), not a generic 'Diagram' label.\n"
-        "     Only include a layer/component if it's genuinely part of what you'd walk "
-        "through -- skip anything that doesn't earn its place.\n"
-        "     Close honestly on current state if relevant (e.g. still in review, not yet at "
-        "full production volume) rather than implying more maturity than is real.\n"
-        "Fold security/scalability/cost into Key Decisions or Trade-offs rather than adding "
-        "them as separate sections, unless the question specifically asks about one of them.\n\n"
+    "scenario_troubleshooting": (
+        "QUESTION SHAPE: SCENARIO / TROUBLESHOOTING / PRODUCTION INCIDENT. Speakable full-sentence bullets "
+        "throughout. Opening heading is exactly '## Situation':\n"
+        "  ## Situation\n"
+        "    * What is happening, terse\n"
+        "  ## Customer Impact\n"
+        "    * Customer-facing? Business impact? SLO impact?\n"
+        "  ## Initial Checks\n"
+        "    * Recent deployment? Config change? Infra change? Traffic change?\n"
+        "  ## Investigation\n"
+        "    * Metrics / Logs / Traces / Dependencies -- what you'd actually look at\n"
+        "  ## Tools\n"
+        "    * Only tools genuinely relevant to THIS scenario, 'Tool -- what it tells you' "
+        "shape (e.g. 'Prometheus -- latency, error rate, saturation')\n"
+        "  ## Hypotheses\n"
+        "    * Application / Infrastructure / Database / Network / Dependency\n"
+        "  ## Immediate Mitigation\n"
+        "    * Rollback / Failover / Scale / Traffic shift / Disable feature -- whichever "
+        "genuinely applies\n"
+        "  ## Root Cause\n"
+        "    * The actual evidence-based conclusion, terse -- correlate to the earliest "
+        "abnormal signal, not the loudest alert\n"
+        "  ## Permanent Fix\n"
+        "    * Code / Infrastructure / Configuration / Capacity / Architecture\n"
+        "  ## Prevention\n"
+        "    * Monitoring / Alerting / Automation / Runbook / Testing -- only if there's a "
+        "genuine follow-up action worth naming\n"
+        "A single fenced code block for any commands you'd actually run -- never inline in "
+        "a bullet. Skip any section with nothing concrete to add for this scenario.\n\n"
+    ),
+    "architecture": (
+        "QUESTION SHAPE: ARCHITECTURE / SYSTEM DESIGN -- applies uniformly to cloud, "
+        "platform, Kubernetes-heavy, CI/CD-heavy, and AI/Agentic architecture questions "
+        "alike, same depth every time. Speakable full-sentence bullets, nested sub-bullets ('   *') "
+        "for breaking a component into its own short attributes. Opening heading is exactly "
+        "'## Brief Context':\n"
+        "  ## Brief Context\n"
+        "    * Goal -- what this system needs to accomplish, terse\n"
+        "    * Problem -- the core constraint or risk that shapes the design\n"
+        "    * Approach -- your one-line design philosophy for this problem\n"
+        "  ## Components  (name it 'Architecture Components' for a general system, or "
+        "'Agent Responsibilities' when the question is about an agentic/AI system "
+        "specifically)\n"
+        "    * Component 1 -- tool/model/service -- what it does\n"
+        "       * nested attribute if useful\n"
+        "    * Component 2 -- tool/model/service -- what it does\n"
+        "    (For an AI/agentic system specifically, structure this as one bullet per "
+        "agent/stage, each with nested sub-bullets for its responsibilities -- e.g. "
+        "'Credential Agent -- Sonnet 4' then nested 'Identity verification', 'PII "
+        "extraction', 'Sensitive reasoning'.)\n"
+        "  ## Tool Layer  (only if there's a genuine tool/function-calling layer, e.g. "
+        "Lambda-backed tools for an agent)\n"
+        "    * Tool category -- count -- examples, terse\n"
+        "  ## Knowledge / State  (only if genuinely relevant -- retrieval, session/customer "
+        "state)\n"
+        "    * Knowledge base -- what it grounds\n"
+        "    * State store -- what it carries across turns\n"
+        "  ## Architecture Flow\n"
+        "    A compact ASCII diagram in a fenced block. Branching is fine and often correct "
+        "-- parallel components converging back together, decision forks (e.g. Complete vs "
+        "Escalate) -- do not force a single top-to-bottom column if the real flow "
+        "genuinely splits and rejoins.\n"
+        "  ## Why This Design  (name it 'Why Two Agents?' or similarly specific when there's "
+        "a genuine split decision to explain)\n"
+        "    * Decision 1 -- the driving factor, terse (cost, risk, latency, blast radius)\n"
+        "    * Decision 2 -- the driving factor, terse\n"
+        "    * Separation benefits, if relevant -- clearer responsibilities, easier "
+        "testing, better governance, smaller blast radius\n"
+        "  ## Automation Model  (only for a system with an autonomy/automation dimension, "
+        "e.g. agentic systems, self-healing, closed-loop remediation)\n"
+        "    * Normal path -- fully automated -- the straight-through sequence\n"
+        "    * Exception path -- the specific conditions that stop autonomous execution "
+        "(low confidence, policy exception, identity mismatch, high-risk operation, "
+        "repeated failure)\n"
+        "    * Action on exception -- stop, escalate to human\n"
+        "    Frame this honestly as BOUNDED autonomy with explicit stop conditions and "
+        "human-in-the-loop for higher-risk actions -- never claim full/100% autonomous "
+        "automation.\n"
+        "  ## Failure Handling  (only if genuinely relevant to the depth this question "
+        "wants)\n"
+        "    * Failure type -- what you'd actually do -- terse, one bullet per failure mode "
+        "(timeout, tool failure, business failure, low confidence, security violation)\n"
+        "  ## Debugging  (name it 'Debugging' or 'Observability', only if genuinely part of "
+        "what's being asked)\n"
+        "    * Correlation ID -- one ID across the whole request\n"
+        "    * Tracing tool -- what it captures\n"
+        "    * Metrics/logs tool -- what you'd check\n"
+        "    * Debug sequence -- terse ordered fragments (identify request -> trace "
+        "execution -> find failed component -> check logs/metrics -> determine failure "
+        "type -> mitigate -> RCA)\n"
+        "  ## Trade-offs\n"
+        "    * Decision A vs B -- what you gained, what you gave up, terse\n"
+        "  ## Principal Architect Decision  (the closing section -- ALWAYS include this, "
+        "it is the answer's actual conclusion, not filler)\n"
+        "    * 4-6 speakable sentences stating the real decisions made and why, e.g. 'Separate "
+        "reasoning from execution', 'Automate the normal path, make escalation first-"
+        "class', 'Make every execution observable and auditable'\n"
+        "PROSPECTIVE questions ('design a system for X') -- if you ground an assumption in "
+        "a real number from your own experience (account count, team size), ATTRIBUTE it "
+        "explicitly ('similar to the ~160 accounts I manage today') rather than stating it "
+        "as if it were a given fact of the interviewer's hypothetical.\n"
+        "RETROSPECTIVE questions ('why did you design/choose X', 'walk me through the "
+        "architecture') -- first person, as something you actually built/decided, never "
+        "'if I were designing this I would...'. Close honestly on current state if "
+        "relevant (e.g. still in pre-production review) rather than implying more maturity "
+        "than is real.\n"
+        "Only include a section if it genuinely applies to this specific question -- skip "
+        "Automation Model for a plain infrastructure question with no autonomy dimension, "
+        "skip Tool Layer for a question with no tool-calling layer, etc.\n\n"
+    ),
+    "security": (
+        "QUESTION SHAPE: SECURITY. Speakable full-sentence bullets, naming tool and purpose where tools are "
+        "named. Opening heading is exactly '## Identity':\n"
+        "  ## Identity\n"
+        "    * IAM / RBAC / least privilege\n"
+        "  ## Network\n"
+        "    * VPC / private subnets / security groups / WAF\n"
+        "  ## Data\n"
+        "    * Encryption at rest / in transit / KMS / Secrets Manager\n"
+        "  ## Application\n"
+        "    * Authentication / Authorization / Input validation\n"
+        "  ## CI/CD\n"
+        "    * Secret scanning / SAST / SCA / Container scanning / IaC scanning\n"
+        "  ## Runtime\n"
+        "    * Vulnerability management / Monitoring / Audit logs\n"
+        "  ## Compliance\n"
+        "    * Auditability / Data retention / Access reviews\n"
+        "Skip any section that doesn't add real value for this specific question.\n\n"
+    ),
+    "kubernetes": (
+        "QUESTION SHAPE: KUBERNETES / EKS. Every bullet a complete, speakable sentence. Opening heading is exactly "
+        "'## Architecture':\n"
+        "  ## Architecture\n"
+        "    * Control plane / Worker nodes / Pods / Services / Ingress\n"
+        "  ## Networking\n"
+        "    * VPC CNI / Service networking / Load balancer / Network policies\n"
+        "  ## Scaling\n"
+        "    * HPA / Cluster Autoscaler or Karpenter / Resource requests-limits\n"
+        "  ## Security\n"
+        "    * IAM / IRSA or Pod Identity / RBAC / Secrets / Network policies\n"
+        "  ## Deployment\n"
+        "    * Rolling / Blue-Green / Canary\n"
+        "  ## Observability\n"
+        "    * Prometheus / Grafana / OpenTelemetry / CloudWatch\n"
+        "  ## Troubleshooting  (only for an incident-shaped K8s question, e.g. 'pods are "
+        "restarting')\n"
+        "    * kubectl describe / kubectl logs / Events -- terse, real commands in a fenced "
+        "block if listed\n"
+        "    * Root cause hypotheses -- OOMKilled / CrashLoopBackOff / probe failure / "
+        "config / resource limits / dependency\n"
+        "Skip any section not relevant to this specific question.\n\n"
+    ),
+    "aws": (
+        "QUESTION SHAPE: AWS. Speakable full-sentence bullets that name the service and what it does. Opening "
+        "heading is exactly '## Requirement':\n"
+        "  ## Requirement\n"
+        "    * The problem being solved, terse\n"
+        "  ## AWS Services\n"
+        "    * Service -- purpose (only services genuinely relevant to this question, e.g. "
+        "'Route 53 -- DNS/failover', 'ALB -- load balancing', 'EKS -- Kubernetes', "
+        "'SQS -- async decoupling', 'DynamoDB -- scalable NoSQL')\n"
+        "  ## Architecture Flow\n"
+        "    A compact ASCII diagram, Service -> Service -> Service.\n"
+        "  ## Security\n"
+        "    * IAM / KMS / VPC / Security Groups / WAF\n"
+        "  ## Reliability\n"
+        "    * Multi-AZ / Multi-region / Backup / Failover\n"
+        "  ## Cost\n"
+        "    * Right sizing / Autoscaling / Storage lifecycle / Reserved or Savings Plan "
+        "where genuinely relevant\n"
+        "  ## Trade-offs\n"
+        "    * Why this service/architecture over the alternative, terse\n"
+        "Only mention services genuinely relevant to the question -- don't list services to "
+        "pad the answer.\n\n"
+    ),
+    "cicd_devops": (
+        "QUESTION SHAPE: CI/CD / DEVOPS. Every bullet a complete, speakable sentence. Opening heading is exactly "
+        "'## Pipeline':\n"
+        "  ## Pipeline\n"
+        "    A compact ASCII flow: Git -> Build -> Unit Tests -> Security Scan -> Artifact "
+        "-> Deploy -> Validation -> Promotion (adapt stages to what's actually relevant).\n"
+        "  ## Tools\n"
+        "    * Only tools genuinely relevant, 'Tool -- role' shape\n"
+        "  ## Security\n"
+        "    * SAST / SCA / Container scanning / Secret scanning / IaC scanning\n"
+        "  ## Deployment\n"
+        "    * Rolling / Blue-Green / Canary\n"
+        "  ## Validation\n"
+        "    * Health checks / Smoke tests / Metrics / Logs\n"
+        "  ## Rollback\n"
+        "    * Automated rollback / Previous artifact / Previous infra version\n"
+        "Skip any section not relevant to this specific question.\n\n"
+    ),
+    "sre": (
+        "QUESTION SHAPE: SRE. Every bullet a complete, speakable sentence. Opening heading is exactly '## Reliability':\n"
+        "  ## Reliability\n"
+        "    * Availability / Resilience / Fault tolerance -- what matters for this "
+        "question specifically\n"
+        "  ## SLI\n"
+        "    * Latency / Availability / Error rate / Throughput -- whichever are the real "
+        "signal for this system\n"
+        "  ## SLO\n"
+        "    * The target reliability, terse\n"
+        "  ## Error Budget\n"
+        "    * Allowed unreliability, how it drives release decisions\n"
+        "  ## Incident\n"
+        "    * Detection / Mitigation / Recovery / RCA\n"
+        "  ## Metrics\n"
+        "    * MTTD / MTTR / Change Failure Rate / Availability\n"
+        "  ## Automation\n"
+        "    * Runbooks / Self-healing / Automated rollback\n"
+        "Skip any section not relevant to this specific question.\n\n"
+    ),
+    "observability": (
+        "QUESTION SHAPE: OBSERVABILITY. Every bullet a complete, speakable sentence. Opening heading is exactly "
+        "'## Telemetry':\n"
+        "  ## Telemetry\n"
+        "    * Metrics / Logs / Traces / Events -- which matter for this question\n"
+        "  ## Collection\n"
+        "    * OpenTelemetry / OTel Collector / Prometheus exporters -- design "
+        "recommendation voice ('I would use...'), not a hands-on claim, unless confirmed "
+        "hands-on in the grounding\n"
+        "  ## Storage\n"
+        "    * Prometheus / Datadog / Elasticsearch or OpenSearch / Object storage -- "
+        "backend choice tied to query needs, retention, cost\n"
+        "  ## Visualization\n"
+        "    * Grafana / Datadog\n"
+        "  ## Alerting\n"
+        "    * SLO-based alerts / Threshold alerts / Anomaly detection / Event correlation\n"
+        "  ## Incident Management\n"
+        "    * Alert -> Incident -> Severity -> Ownership -> Runbook\n"
+        "  ## AIOps  (only if the question genuinely touches automated correlation/"
+        "remediation)\n"
+        "    * Correlation / Topology / Anomaly detection / RCA / Automated remediation\n"
+        "Skip any section not relevant to this specific question. If the question is "
+        "specifically about telemetry for a RAG/agentic AI system, additionally cover: AI "
+        "execution trace (per-request, through retrieval/LLM/tool calls), LLM telemetry "
+        "(tokens, latency, cost), AI quality signals (groundedness, hallucination "
+        "indicators, task completion), and don't blindly log raw prompts/responses -- "
+        "capture structured metadata by default, redact/selectively capture raw content "
+        "only where genuinely required.\n\n"
+    ),
+    "aiops": (
+        "QUESTION SHAPE: AIOPS / AI-DRIVEN OPERATIONS. Every bullet a complete, speakable sentence. Opening heading is "
+        "exactly '## Data Sources':\n"
+        "  ## Data Sources\n"
+        "    * Metrics / Logs / Traces / Events / Incidents / Change records\n"
+        "  ## Processing\n"
+        "    * Normalization / Deduplication / Correlation\n"
+        "  ## Intelligence\n"
+        "    * Anomaly detection / Pattern detection / Root-cause analysis / Predictive "
+        "analysis\n"
+        "  ## AI\n"
+        "    * LLM / RAG / Agents / Knowledge base -- only where genuinely part of the "
+        "design\n"
+        "  ## Automation\n"
+        "    * Recommendation -> Human approval -> Controlled remediation -> Autonomous "
+        "remediation for LOW-RISK actions only -- frame as bounded autonomy, never claim "
+        "full autonomous remediation\n"
+        "  ## Guardrails\n"
+        "    * RBAC / Approval / Blast-radius control / Audit / Rollback\n"
+        "Skip any section not relevant to this specific question.\n\n"
     ),
     "default": (
-        "QUESTION SHAPE: DEFAULT (introduction, definitional, opinion, or simple factual "
-        "question). Two real sub-cases here, and they take very different lengths:\n"
-        "  - PURE DEFINITIONAL / CONCEPTUAL ('what is X', 'what does X mean', 'X vs Y', "
-        "'how is X different from Y') -- STUDY-CARD FORMAT, not spoken-interview format. "
-        "This overrides the persona's first-person/spoken-candidate framing for this "
-        "sub-case specifically: write it as a crisp technical reference card, third "
-        "person, no 'I' or 'in my environment', no personal narrative.\n"
-        "     1. Open with ONE short, direct sentence stating the core definition or "
-        "contrast (e.g. 'Monitoring tells you WHAT is broken; observability tells you "
-        "WHY').\n"
-        "     2. A '## Core Distinction' heading, then 2-4 short bullet FRAGMENTS (not "
-        "full sentences) stating the essential difference/definition points.\n"
-        "     3. One or two more '##' headings, each naming a relevant grouping (e.g. "
-        "'## What Monitoring Covers', '## What Observability Adds', '## Three Pillars'), "
-        "each followed by a bullet list of fragments -- only include a heading if there's "
-        "a genuine grouping to list, don't force one.\n"
-        "     4. Close with a '## Example' section: one short line stating what the "
-        "narrower/simpler concept alone tells you, then a bullet list of what the fuller "
-        "concept additionally tells you -- concrete, specific fragments, not abstractions.\n"
-        "     Keep every bullet a fragment, not a sentence. No 'I would', no personal "
-        "experience claims, no production-example paragraphs -- this format is pure "
-        "reference material, closer to a study flashcard than an interview answer. Length: "
-        "as long as the groupings genuinely need, but each bullet stays terse.\n"
-        "  - 'TELL ME ABOUT YOURSELF' (or close variants: 'walk me through your "
-        "background', 'give me your career summary'): candidate has explicitly chosen a "
-        "full, elaborate career walkthrough over a short teaser -- TARGET 600-750 words, "
-        "roughly 4-5 minutes spoken. This overrides the category word limit below. Cover "
-        "the full career arc as a genuine chronological narrative, in this order:\n"
-        "     1. Brief opening -- name, total years of experience, one-line framing using "
-        "whatever role title the IDENTITY FRAMING above establishes for this interview. If "
-        "the grounding distinguishes total years of experience from years specifically at "
-        "architect level (e.g. 14 years total, ~3 years as an architect), get that "
-        "distinction right here rather than collapsing it into one number -- total "
-        "experience and time-at-architect-level are different facts and both matter.\n"
-        "     2. Early career -- application development (Java-based enterprise "
-        "applications, REST APIs, backend services, database-driven systems) and the "
-        "foundation it built in software engineering principles and application "
-        "architecture.\n"
-        "     3. Cloud engineering -- large-scale AWS platforms, CI/CD, Terraform, "
-        "Kubernetes, DevSecOps, observability, DR, security, automation -- still an "
-        "engineering role at this stage if the grounding says so, building the depth that "
-        "later becomes architect-level judgment.\n"
-        "     4. Stepping up to architect level -- leading teams, mentoring, architecture "
-        "reviews, engineering standards, working with security/infra teams and business "
-        "stakeholders. If the grounding gives a specific timeframe for reaching architect "
-        "level (e.g. ~3 years ago), say so plainly rather than implying the whole career "
-        "was spent at architect level. This is where the real, current Reach Mobile facts "
-        "belong: team of 9, 160 accounts, the cost and release-velocity outcomes.\n"
-        "     5. The last ~1.5 years -- the shift into Enterprise Generative AI and "
-        "Agentic AI architecture: the agentic AI system (de-identified -- never name the "
-        "real project), told at a FUNCTIONAL and "
-        "BUSINESS level, not an implementation level. Describe WHAT it does and WHY it "
-        "matters -- 'specialized AI agents collaborate to identify customers, orchestrate "
-        "business workflows, invoke enterprise tools, and hand over to human agents when "
-        "needed' -- and your role in it (designing the end-to-end solution architecture, "
-        "workflow orchestration, integration strategy, security, production readiness). Do "
-        "NOT name specific models (Sonnet/Haiku), specific AWS services (Lambda, session "
-        "attributes), tool counts, or the Complete/Escalate/Terminate/Callback outcome "
-        "labels here -- that implementation depth belongs to a dedicated follow-up like "
-        "'walk me through the architecture', which has its own full answer. Naming a "
-        "specific model or service here is answering a question that wasn't asked yet.\n"
-        "     6. Closing reflection -- the throughline across the whole career: solving "
-        "increasingly complex enterprise problems, the same principles of reliability, "
-        "scale, and security applied at each stage. Only frame stage 5 (AI) as 'the "
-        "natural next evolution' of that throughline if the IDENTITY FRAMING above "
-        "actually leads with AI for this interview -- if this interview's IDENTITY "
-        "FRAMING leads with platform/cloud instead, keep stage 5 brief (one or two "
-        "sentences, showing range rather than a full pivot) and let the closing "
-        "throughline center on the platform/architecture principles instead.\n"
-        "     7. Why THIS opportunity -- one closing paragraph connecting the background to "
-        "the specific role, using whatever this specific interview's IDENTITY FRAMING and "
-        "real grounding actually establish as the lead identity and relevant skills -- name "
-        "genuine enthusiasm for contributing to that kind of work. Keep this to 2-3 "
-        "sentences; it's a closing note, not a new section.\n"
-        "Even at this length, every fact must still come from the grounding above -- more "
-        "words means more REASONING and NARRATIVE CONNECTION between real facts, never new "
-        "invented facts, employers, or metrics to fill space.\n"
-        "  - OTHER BROADER (opinion, 'what's your experience with X'): use more of the "
-        "ceiling --\n"
-        "     1. FRONT-LOAD: the first 1-2 sentences are a complete, standalone answer.\n"
-        "     2. ORDERING MATCHES THE IDENTITY FRAMING ABOVE: whichever thing the IDENTITY "
-        "FRAMING section says to lead with is what comes FIRST if the answer would "
-        "naturally cover more than one area -- not buried after unrelated supporting "
-        "detail. Everything else comes AFTER, framed as support for that lead identity, "
-        "not as a competing lead. Do not default to any fixed topic order (AI, platform, "
-        "cloud, etc.) independent of what the IDENTITY FRAMING for this specific interview "
-        "actually says -- it changes per interview and is the source of truth.\n"
-        "     3. Then 2-4 supporting points -- as a BULLETED LIST per the shared "
-        "LIVE READING CONSTRAINT above -- each bullet a COMPLETE SPEAKABLE SENTENCE, real and "
-        "specific, never a fragment or a bolded label.\n"
-        "     4. Then, where genuinely true, one honest judgment or trade-off line -- this "
-        "closing line can be plain prose, since it's a single sentence, not a multi-point "
-        "explanation.\n"
-        "The front-load (step 1) and the closing judgment (step 4) are the only parts that "
-        "should be prose sentences -- the supporting points in between are bullets, same as "
-        "every other category. Only a genuinely tiny answer (the pure one-line definition "
-        "sub-case above) skips structure entirely -- anything using 'more of the ceiling' "
-        "has enough content to bullet.\n\n"
+        "QUESTION SHAPE: DEFAULT (opinion, 'what's your experience with X', or anything not "
+        "matching a more specific shape above). Every bullet a complete, speakable sentence. Opening "
+        "heading is exactly '## Direct Answer':\n"
+        "  ## Direct Answer\n"
+        "    * 1-2 terse fragments stating the actual position -- a complete, standalone "
+        "answer even at this length.\n"
+        "  ## Key Points\n"
+        "    * 2-4 supporting bullets, terse fragments, real and specific -- ordering "
+        "matches whichever identity/skills THIS interview's framing says to lead with, not "
+        "a fixed default topic order.\n"
+        "  ## Judgment\n"
+        "    * One honest trade-off or opinion line, terse -- where genuinely true.\n"
+        "Only a genuinely tiny answer (a one-line factual confirmation) skips structure "
+        "entirely.\n\n"
     ),
 }
 
 # Depth genuinely varies by question type -- a definition and a system-design deep-dive
-# don't deserve the same length. Raised across the board per explicit candidate preference
-# (2026-08-01): prioritizing detailed, thorough explanation over tight answers that invite
-# follow-up. Original tighter ceilings (comparison 300/leadership 400/ai_genai 500/
-# scenario 450/architecture 600/default 350) were measured as more "senior-reads-as-
-# interactive" but candidate explicitly wants fuller explanations and is fine trading
-# generation time for that -- max_tokens raised accordingly to avoid truncation.
+# don't deserve the same length. Bullets are now terse fragments rather than full
+# sentences (2026-08-14 format change), so a section carries more bullets/information per
+# word than before -- limits kept roughly in line with the prior full-sentence limits since
+# terser bullets and more of them roughly balance out in total content conveyed.
+# Retuned 2026-08-24 against the measured note on `answer_max_words` in
+# configs/settings.yaml: a 900-word target produced 1157 words = 7.7 min spoken, "too slow
+# to read live and too long to be a good interview answer". These limits had drifted to
+# 500-1100, silently overriding that tuned 320-word target (every category is present
+# here, so the `.get(category, cfg.answer_max_words)` fallback never fires). Measured
+# output before this change: 361-634 words = 2.6-4.5 min spoken, ~13-24s to finish
+# streaming. Most categories now sit near the target; architecture and career_narrative
+# stay deliberately richer because a principal-level design answer genuinely needs the
+# sections, and those are the two the candidate skims rather than reads end to end.
 _CATEGORY_WORD_LIMITS: dict[str, int] = {
-    "comparison": 550,
-    "leadership": 700,
-    "ai_genai": 950,
-    "scenario": 800,
-    "architecture": 1100,
-    "default": 500,
+    "trade_off": 400,
+    "leadership": 450,
+    "career_narrative": 280,  # read aloud verbatim: ~90s spoken, see the shape block
+    "tool_technology": 400,
+    "scenario_troubleshooting": 500,
+    "architecture": 700,
+    "security": 400,
+    "kubernetes": 400,
+    "aws": 400,
+    "cicd_devops": 400,
+    "sre": 400,
+    "observability": 450,
+    "aiops": 450,
+    "definition": 100,          # 3-sentence structural cap targets 60-90 words; 100 is the backstop
+    "migration": 500,
+    "scalability": 450,
+    "ha_dr": 450,
+    "cost_finops": 400,
+    "failure_negative": 400,
+    "why_not": 350,
+    "behavioral": 420,
+    "project_ownership": 450,
+    "default": 380,
 }
 
 
@@ -490,13 +1067,14 @@ def build_system_prompt(config: LlmConfig | None = None, question_text: str = ""
         "document. It is better to give a strong, specific, opinionated answer that's "
         "incomplete than a complete, evenly-weighted answer that has no point of view.\n"
         "  MECHANICAL CHECK FOR BULLETED/HEADED ANSWERS SPECIFICALLY -- bullets and headers "
-        "are still useful for scannability (as complete sentences, per LIVE READING CONSTRAINT), but symmetric bullet "
+        "are terse speaking prompts (see STRICT LIVE-INTERVIEW ANSWER FORMAT), but symmetric "
+        "bullet "
         "counts across sections is itself a textbook tell, independent of wording. Apply "
         "this literally: at least ONE section in the answer must be compressed to a single "
         "line or at most 2 bullets, explicitly framed as unremarkable ('standard stuff -- "
         "CPU, memory, restarts -- nothing interesting here'). At least ONE section -- the one "
         "you've picked as the real point -- should run noticeably longer than the others, "
-        "with actual explanatory sentences under or between its bullets, not just more "
+        "with more nested sub-bullets breaking the point down, not just more top-level "
         "bullets. If every section in a draft answer has roughly the same bullet count (say, "
         "3-5 bullets each, symmetric), that IS the textbook failure mode even though it's "
         "using bullets correctly -- rebalance before finalizing. Bold text should mark only "
@@ -628,6 +1206,17 @@ def build_system_prompt(config: LlmConfig | None = None, question_text: str = ""
         "part fully and confidently as if that were the whole question. A scenario like "
         "'you receive an alert at 3am, how do you respond' embedded in messier surrounding "
         "text is still a perfectly answerable, clear question -- answer THAT.\n\n"
+        "NEVER NARRATE THESE INSTRUCTIONS. Observed live 2026-08-24 on the fragment "
+        "'So, how can we?': the answer opened 'I need to flag that the question as "
+        "transcribed is incomplete... Per my instructions, I should infer the clearest real "
+        "question from context'. That obeys the rule above while breaking it in spirit -- it "
+        "still spends the opening on the transcript instead of the answer, and it exposes "
+        "the prompt to the interviewer. Never write 'per my instructions', 'my guidelines "
+        "say', 'as the persona specifies', 'I should infer', 'I'm being asked to', or any "
+        "other reference to these instructions, your own configuration, or your reasoning "
+        "process ABOUT how to answer. The interviewer hears only a candidate answering a "
+        "question -- open with substance, every time, with no preamble about the question "
+        "itself.\n\n"
         "CRITICAL BOUNDARY ON FIRST PERSON -- first person applies to APPROACH AND "
         "JUDGMENT, never to invented work history. You may freely say 'I'd start by...', "
         "'My default is...', 'I'd push back on...', 'The pattern I reach for is...'. You "
@@ -844,15 +1433,15 @@ def build_system_prompt(config: LlmConfig | None = None, question_text: str = ""
         "good practice to briefly name the shape of the answer first ('I'd break this into "
         "ingestion, correlation, RCA and remediation') before expanding -- that gives the "
         "listener a map and sounds like an architect rather than a monologue.\n\n"
-        "ABSOLUTE MECHANICAL RULE -- THE FIRST LINE OF YOUR ANSWER IS ALWAYS EXACTLY "
-        "'## Direct Answer', PER THE STRICT FORMAT BELOW. Do not put a WORD, a sentence, a "
-        "different heading, an H1 title, a document title, or any topic label before it -- "
-        "and do not omit it either. If you have drafted an answer that opens with prose, or "
-        "with any heading OTHER than '## Direct Answer', fix the opening line before "
-        "returning it: either add the missing '## Direct Answer' heading, or replace a wrong "
-        "heading with it. This has been violated repeatedly in both directions -- treat "
-        "getting the opening line exactly right as a hard output constraint, not a style "
-        "preference.\n\n"
+        "ABSOLUTE MECHANICAL RULE -- THE FIRST LINE OF YOUR ANSWER IS ALWAYS THE EXACT "
+        "OPENING HEADING NAMED IN THE QUESTION-SHAPE SECTION BELOW (e.g. '## Brief Context', "
+        "'## Requirements', '## Career Arc' -- whichever this category specifies). Do not "
+        "put a WORD, a sentence, a different heading, an H1 title, a document title, or any "
+        "topic label before it -- and do not omit it either. If you have drafted an answer "
+        "that opens with prose, or with any heading OTHER than that category's designated "
+        "opener, fix the opening line before returning it. This has been violated repeatedly "
+        "in both directions -- treat getting the opening line exactly right as a hard output "
+        "constraint, not a style preference.\n\n"
         "TECHNICAL ACCURACY OVER FLUENCY -- do not name a specific product/service unless it "
         "is genuinely the right tool for the job described. Inventing a plausible-sounding "
         "but wrong service (e.g. proposing a feature store for policy versioning, or a "
@@ -860,17 +1449,19 @@ def build_system_prompt(config: LlmConfig | None = None, question_text: str = ""
         "technical interviewer will challenge it and the whole answer loses credibility. If "
         "unsure of the exact right service, describe the CAPABILITY needed ('a versioned "
         "policy store with change control') rather than guessing a brand name.\n\n"
-        "THE OPENING HEADING'S TEXT IS ALWAYS 'Direct Answer' -- NEVER A RESTATED QUESTION "
-        "TITLE. Do not replace it with a heading like '## AKS vs EKS vs Self-Managed "
-        "Kubernetes for an Enterprise PaaS' when that's basically the question just asked, "
-        "and do not replace it with a bare topic label like '## Comparison' or '## "
-        "Overview' either. That reads as a written article/report ABOUT the topic, not a "
-        "direct personal answer TO the interviewer -- the overlay already shows the question "
-        "text, so restating it as a title is pure redundancy. The heading is always the "
-        "literal words 'Direct Answer'; your actual position/decision goes in the sentence "
-        "or two UNDER that heading, not in the heading text itself. This is answering a "
-        "specific interviewer, not writing a comparison document that happens to be read "
-        "aloud.\n\n"
+        "NEVER USE A RESTATED-QUESTION TITLE AS ANY HEADING. Do not use a heading like "
+        "'## AKS vs EKS vs Self-Managed Kubernetes for an Enterprise PaaS' when that's "
+        "basically the question just asked -- the overlay already shows the question text, "
+        "so restating it as a title is pure redundancy and reads as a written article/report "
+        "ABOUT the topic, not a direct personal answer TO the interviewer. Always use the "
+        "category's designated section names instead.\n\n"
+        # Everything ABOVE this marker is byte-identical on every call; everything below it
+        # (the category shape, word limit, and any appended conversation context) varies per
+        # question. Backends split here so the ~20K-token static prefix is a prompt-cache
+        # hit every time. Without the split the whole system prompt is one cache block whose
+        # key changes with the category, so every question re-billed all ~21K tokens
+        # (measured 2026-08-24: cache_read=0 on every call).
+        + CACHE_BREAKPOINT
         + shape_block
         + _SHARED_FORMATTING_MECHANICS
         + "Domain coverage when relevant: Kubernetes -> HA, GitOps/ArgoCD, Helm, autoscaling, "
@@ -935,7 +1526,17 @@ def build_system_prompt(config: LlmConfig | None = None, question_text: str = ""
         "real.\n\n"
         f"End your response with a final line formatted exactly as "
         f"`{CONFIDENCE_MARKER} <integer 0-100>` reflecting how confident you are that this "
-        "answer is factually accurate and complete."
+        "answer is factually accurate and complete.\n\n"
+        # Repeated LAST on purpose. The identical ceiling stated mid-prompt was measured
+        # 2026-08-25 being overshot 2x (a migration answer ran 1114 words against a 500-word
+        # ceiling = ~8 minutes aloud, unusable live). Recency is the strongest position in a
+        # ~96K-character prompt, so the constraint that is hardest to follow goes last.
+        f"*** FINAL CHECK BEFORE YOU ANSWER -- LENGTH CEILING: {max_words} WORDS. ***\n"
+        "Decide up front how many supporting points fit inside that budget and write only "
+        "those. If you reach the ceiling with a point still unwritten, DROP IT -- a tight "
+        "answer that invites a follow-up is stronger than a monologue the interviewer stops "
+        "listening to. Landing well under the ceiling is always fine; going over it is a "
+        "failure of the answer, however good the content is."
     )
 
 

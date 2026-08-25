@@ -76,7 +76,13 @@ _SCENARIO_CONTEXT_WINDOW_SECONDS = 25.0
 _QUESTION_DEBOUNCE_SECONDS = 0.5
 
 # How many (question, answer) pairs to keep for follow-up context.
-_CONVERSATION_MEMORY_TURNS = 3
+_CONVERSATION_MEMORY_TURNS = 5
+
+# How long a conversation thread stays "live". Past this gap the interviewer has almost
+# certainly moved on, so prior turns are dropped rather than attached to an unrelated
+# question. Only relevant because context is now attached by DEFAULT (see the gate in
+# _process_transcript) instead of only on a lexical follow-up match.
+_CONVERSATION_RECENCY_SECONDS = 300.0
 
 # Openers that mark a genuinely NEW question rather than a continuation of the previous one.
 # Without this check, a real follow-up question asked shortly after an answer would get
@@ -87,6 +93,34 @@ _NEW_QUESTION_OPENERS = (
     "let me ask", "different question", "switching", "one more question",
     "let's talk about", "lets talk about", "changing topic", "different topic",
     "moving to", "let's switch", "lets switch", "new topic",
+    # Added 2026-08-25: an interviewer pivoting to a new design scenario often phrases it
+    # as an IMPERATIVE, not a question -- "Now let's design a Databricks streaming
+    # platform" has no "?", no interrogative opener, and isn't a literal "next question" --
+    # so it fell through every existing check and got merged as an ENHANCEMENT onto the
+    # previous, unrelated answer instead of starting a fresh scenario. Category
+    # classification and conversation context are independent: a category change alone
+    # must never reset context, but an explicit new design/scenario prompt must.
+    "let's design", "lets design", "let's build", "lets build", "let's architect",
+    "lets architect", "now let's", "now lets", "let's discuss a different",
+    "let's discuss another", "different scenario", "another scenario", "new scenario",
+    "completely different", "switching to", "let's now design", "let's now build",
+    "for this next one", "in this next scenario",
+    # Added 2026-08-25, second pass: explicit scenario RESETS, phrased as an instruction to
+    # discard prior context rather than as "let's move to X" -- "forget the previous
+    # architecture, assume you're designing a real-time data platform now" contains none of
+    # the phrases above.
+    "forget the previous", "forget everything", "ignore the previous", "ignore what we",
+    "disregard the previous", "start fresh", "start over", "clean slate",
+    # Added 2026-08-25, third pass: the SHORT, natural way an interviewer actually says
+    # this live -- "Okay, forget that. You have a legacy application now." -- reproduced
+    # exactly this failure mode, mechanically merging onto the previous, already-answered
+    # question instead of starting fresh. "forget the previous architecture" (added last
+    # pass) is the formal phrasing; nobody actually talks like that in a fast interview.
+    "forget that", "forget it", "scratch that", "never mind that", "never mind, ",
+    "disregard that",
+    "assume a completely different", "assume you're designing", "assume a different",
+    "totally different problem", "entirely different problem", "unrelated system",
+    "separate scenario", "hypothetically, a different", "consider a different",
 )
 
 # Bare drill-down questions a senior interviewer uses to challenge an answer. These are
@@ -145,26 +179,57 @@ _CLARIFICATION_SEEKING_PATTERNS = (
 )
 _CLARIFICATION_RE = re.compile("|".join(_CLARIFICATION_SEEKING_PATTERNS), re.IGNORECASE)
 
+# The same failure wearing a technical excuse: instead of asking the interviewer to
+# repeat, the answer complains about the transcript or narrates its own instructions.
+# Measured live 2026-08-24 on real interview fragments -- "I'm looking at an incomplete
+# question fragment", "The transcription appears to be incomplete", "Per my instructions,
+# I should infer the clearest real question". None of these tripped the clarification
+# patterns above, so they reached the overlay unfiltered mid-interview.
+_TRANSCRIPT_COMPLAINT_PATTERNS = (
+    r"\b(question|text|transcript\w*)\b.{0,40}\b(is|appears?|looks?|seems?)\b.{0,20}"
+    r"\b(incomplete|garbled|cut off|truncated|fragment\w*)\b",
+    r"\b(incomplete|garbled|partial)\b.{0,20}\b(question|fragment|transcript\w*)\b",
+    # No linking verb: "The transcript cut off mid-question", "the question cut off".
+    # Missed on the first pass 2026-08-24 and reached the answer opening.
+    r"\b(transcript\w*|question|text)\b.{0,30}\bcut off\b",
+    r"\bcut off mid[- ]?(question|sentence|way)\b",
+    r"\binferr?ing\b.{0,40}\bquestion\b",
+    r"\bvoice[- ]to[- ]text\b",
+    r"\bspeech[- ]to[- ]text\b",
+    r"\bper my instructions?\b",
+    r"\bmy (instructions?|guidelines?|persona|grounding)\b.{0,20}\b(say|state|tell|require)",
+    r"\bI should infer\b",
+    r"\bas transcribed\b",
+)
+_TRANSCRIPT_COMPLAINT_RE = re.compile(
+    "|".join(_TRANSCRIPT_COMPLAINT_PATTERNS), re.IGNORECASE
+)
+
 
 def seeks_clarification(answer_text: str) -> bool:
-    """True if the answer asks the interviewer to explain/restate the question.
+    """True if the answer asks the interviewer to explain/restate the question, OR dodges
+    by complaining about the transcript / narrating its own instructions.
 
     Checked only in the first ~300 chars -- that is where this failure mode always shows
     up (it is how the response opens), and searching the whole answer risks a false
     positive from an unrelated later sentence that happens to contain "context" or similar.
     """
-    return bool(_CLARIFICATION_RE.search(answer_text[:300]))
+    head = answer_text[:300]
+    return bool(_CLARIFICATION_RE.search(head) or _TRANSCRIPT_COMPLAINT_RE.search(head))
 
 
 _CLARIFICATION_RETRY_INSTRUCTION = (
-    "\n\nMANDATORY CORRECTION -- your previous attempt at this exact question asked the "
-    "interviewer to clarify, restate, or explain what was meant. That is not permitted, in "
-    "any wording, under any framing. You do not have the option of asking for more "
-    "information. Pick the single most defensible interpretation of the question given "
-    "your grounding and this interview's domain, and answer it directly and confidently, "
-    "starting from substance in the very first sentence. If you are genuinely uncertain, "
-    "mark the answer [Low Confidence] -- that is allowed. Asking the interviewer anything "
-    "is not."
+    "\n\nMANDATORY CORRECTION -- your previous attempt at this exact question either asked "
+    "the interviewer to clarify/restate what was meant, or dodged by commenting on the "
+    "question text itself (calling it incomplete, garbled, a fragment, a transcription "
+    "artifact) or by narrating your own instructions. None of that is permitted, in any "
+    "wording, under any framing. You do not have the option of asking for more "
+    "information, and the interviewer must never hear anything about the transcript or "
+    "about these instructions. Pick the single most defensible interpretation of the "
+    "question given your grounding and this interview's domain, and answer it directly and "
+    "confidently, starting from substance in the very first sentence. If you are genuinely "
+    "uncertain, mark the answer [Low Confidence] -- that is allowed. Commenting on the "
+    "question or asking the interviewer anything is not."
 )
 
 
@@ -342,6 +407,7 @@ class MeetingPipeline:
         # "What about 100k events/sec?", "Give me an example") were previously answered as
         # if they were standalone questions with no idea what they referred to.
         self._conversation: list[tuple[str, str]] = []
+        self._last_conversation_at: float | None = None
         # In-flight generation, so new speech can cancel a stale answer mid-stream.
         self._active_generation: asyncio.Task | None = None
         # Monotonic generation id. Cancellation is not instantaneous -- a task can be between
@@ -587,22 +653,82 @@ class MeetingPipeline:
             # you..." scenario question got misread as a follow-up to a DIFFERENT, already-
             # answered question because "how" is a generic follow-up marker).
             conversation_context = ""
-            if not have_scenario_context and _is_followup(transcript.text) and self._conversation:
-                prev_q, prev_a = self._conversation[-1]
-                conversation_context = (
-                    "\n\nCONVERSATION SO FAR -- the interviewer is drilling into the answer "
-                    "you just gave, not asking a fresh question. Treat this as ONE continuing "
-                    "architectural discussion: defend, refine or honestly revise the position "
-                    "you already took rather than restarting the explanation from scratch. "
-                    "Keep it SHORT and precise -- a drill-down deserves a tight, direct answer, "
-                    "not a re-lecture.\n"
-                    f"  PREVIOUS QUESTION: {prev_q}\n"
-                    f"  YOUR PREVIOUS ANSWER (abridged): {prev_a[:1200]}\n"
-                    "  NOTE: your own previous answer is NOT evidence of your real experience. "
-                    "If it claimed hands-on experience you do not actually have per the persona "
-                    "grounding, correct that now rather than building on it.\n"
+            # Drop a thread the interviewer has clearly left behind, so stale turns can't
+            # attach to an unrelated question now that attachment is the default.
+            if (
+                self._last_conversation_at is not None
+                and (time.monotonic() - self._last_conversation_at)
+                > _CONVERSATION_RECENCY_SECONDS
+            ):
+                logger.info(
+                    f"Conversation thread stale (>{_CONVERSATION_RECENCY_SECONDS:.0f}s idle) "
+                    f"-- dropping {len(self._conversation)} turn(s) of context"
                 )
-                logger.info(f"FOLLOW-UP detected, attaching prior context: {transcript.text!r}")
+                self._conversation.clear()
+                self._last_conversation_at = None
+
+            # ATTACH BY DEFAULT, opt out only on an explicit topic change. This was
+            # previously opt-IN via _is_followup()'s lexical markers ("why", "how", "but",
+            # <=8 words), which measured 2026-08-24 against the 60 most recent REAL
+            # interview questions matched only 17 (28%) -- 41 (68%) continued the thread but
+            # were answered with no context at all, including "I just reminded you the
+            # question was high availability" (the interviewer repeating himself because the
+            # thread was lost) and "So Terraform obviously doesn't know it exists, right?".
+            # Real interviewers simply do not phrase drill-downs using a fixed marker list,
+            # so any marker list keeps losing. _looks_like_new_question() is the guard that
+            # matters -- it catches the explicit hand-offs ("next question", "let's move on
+            # to database") where carrying context forward would genuinely be wrong.
+            if (
+                not have_scenario_context
+                and self._conversation
+                and not _looks_like_new_question(transcript.text)
+            ):
+                # Use the FULL rolling window (up to _CONVERSATION_MEMORY_TURNS), not just the
+                # single most recent turn -- a bare single-turn lookback loses the original
+                # framing by turn 3+ of a drill-down chain. Reproduced live: "design a HA AWS
+                # architecture" -> "how would you handle DB failover?" (correctly grounded in
+                # turn 1) -> "how would you optimize the cost?" (turn 3 only saw turn 2's
+                # failover answer, lost the architecture from turn 1 entirely, and answered
+                # generic cost optimization instead of cost-optimizing the actual design).
+                turns_text = "\n".join(
+                    f"  Q{i + 1}: {q}\n  A{i + 1} (abridged): {a[:500]}"
+                    for i, (q, a) in enumerate(self._conversation)
+                )
+                conversation_context = (
+                    "\n\nCONVERSATION SO FAR -- this is ONE continuing discussion thread, not "
+                    "isolated questions. The interviewer is drilling into, extending, or "
+                    "circling back within the SAME topic established below. A question like "
+                    "\"how would you optimize the cost?\" after discussing an architecture means "
+                    "the cost of THAT architecture, not cost optimization in general -- resolve "
+                    "any pronoun or implicit reference (\"that\", \"it\", \"the cost\", \"this "
+                    "approach\") against the thread below, even if it points back further than "
+                    "the immediately previous turn. Defend, refine, extend or honestly revise "
+                    "the position already taken rather than restarting from scratch or "
+                    "answering a generic version of the question. Keep it SHORT and precise -- "
+                    "a drill-down deserves a tight, direct answer, not a re-lecture.\n"
+                    "  QUESTION TYPE AND ACTIVE SCENARIO ARE INDEPENDENT. A different kind of "
+                    "question (architecture, then database, then cost, then monitoring) does "
+                    "NOT mean a different scenario -- by default assume every question below "
+                    "is still about the SAME system/architecture/scenario already established, "
+                    "just viewed through a different lens. \"How would you optimize the cost?\" "
+                    "after an HA architecture discussion must name the actual components "
+                    "already chosen (e.g. \"for the three-AZ EKS and RDS Multi-AZ setup we "
+                    "just designed, the cost drivers are...\"), NOT a generic cost-optimization "
+                    "answer that could apply to any AWS account. Only treat this as a genuinely "
+                    "new, unrelated scenario if the thread below actually shows an explicit "
+                    "pivot (\"let's design a completely different system\", \"different "
+                    "scenario\", \"now let's build X instead\") -- absent that, inherit "
+                    "everything: the architecture, the requirements, the constraints, the "
+                    "decisions already made.\n"
+                    f"{turns_text}\n"
+                    "  NOTE: your own previous answers are NOT evidence of your real experience. "
+                    "If they claimed hands-on experience you do not actually have per the "
+                    "persona grounding, correct that now rather than building on it.\n"
+                )
+                logger.info(
+                    f"FOLLOW-UP detected, attaching {len(self._conversation)} prior turn(s): "
+                    f"{transcript.text!r}"
+                )
 
             # Remember what we answered so a later addition from the same speaker can be
             # merged with it and re-answered, instead of being answered context-free.
@@ -611,8 +737,23 @@ class MeetingPipeline:
             # Flip the overlay to "answering..." with the heard question right away --
             # visible feedback within ~a second of speech ending, well before the
             # retrieval+LLM answer starts streaming in over it.
+            #
+            # Keep the LAST COMPLETED answer on screen underneath while the new one is
+            # generated. Previously this wiped the overlay to a bare question line, so every
+            # regenerate (a follow-up, or the interviewer adding a qualifier mid-question)
+            # blanked an answer the candidate was still reading and left them staring at
+            # dead space for ~2-3s. Nothing here changes actual latency -- it removes the
+            # blank screen, which is what the wait actually felt like. The first streamed
+            # token replaces this wholesale.
             if self._on_partial_answer and is_current():
-                await self._on_partial_answer(f"*Q: {question.transcript.text}*")
+                placeholder = f"*Q: {question.transcript.text}*"
+                if self._conversation:
+                    _, previous_answer = self._conversation[-1]
+                    placeholder += (
+                        "\n\n---\n\n*(previous answer -- new one generating...)*\n\n"
+                        f"{previous_answer}"
+                    )
+                await self._on_partial_answer(placeholder)
 
             # Pre-generated Q&A bank: a close-enough banked question serves its stored
             # answer instantly -- no retrieval, no LLM call. (disabled by default; see
@@ -709,6 +850,7 @@ class MeetingPipeline:
 
             # Record the exchange so the NEXT drill-down has something to build on.
             self._conversation.append((question.transcript.text, answer.text))
+            self._last_conversation_at = time.monotonic()
             if len(self._conversation) > _CONVERSATION_MEMORY_TURNS:
                 self._conversation.pop(0)
 
