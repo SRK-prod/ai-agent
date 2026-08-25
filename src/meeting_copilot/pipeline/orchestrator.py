@@ -78,6 +78,23 @@ _SCENARIO_CONTEXT_WINDOW_SECONDS = 25.0
 # additions, so a long debounce is largely redundant protection paid for on every question.
 _QUESTION_DEBOUNCE_SECONDS = 0.5
 
+# Time-based compound-turn grouping (added 2026-08-25): an interviewer who asks two
+# distinct questions back to back ("What is Terraform?" [3s] "How should you have
+# integrated AI?") should get ONE combined answer, not two separate ones -- these were
+# previously answered independently even when only a few seconds apart, because nothing
+# checked for a SECOND complete question following close behind the first.
+#
+# This is a real, deliberate trade-off, not a free improvement: every genuinely standalone
+# question now also waits up to this long before an answer starts, because the pipeline
+# cannot know in advance whether a second question is coming. Measured baseline TTFA this
+# session was ~1-1.5s; this constant is added on top of that for every question that isn't
+# a same-utterance fragment. Kept short (well under the 30s example in the original ask)
+# specifically to protect that baseline -- it's tuned to catch a real quick follow-up, not
+# a long thinking pause (that case is handled separately, and without any upfront wait, by
+# _SUPERSEDE_WINDOW_SECONDS + the anaphora check in _reads_as_independent_question).
+# Configurable in one place, not hardcoded elsewhere -- see _handle_segment/_debounced_process.
+_QUESTION_MERGE_WINDOW_SECONDS = 4.0
+
 # How many (question, answer) pairs to keep for follow-up context.
 _CONVERSATION_MEMORY_TURNS = 3
 
@@ -123,6 +140,13 @@ _ANAPHORA_MARKERS = (
     "integrate it", "integrate that", "combine it", "combine that", "connect it",
     "connect that", "extend it", "extend that", "use it with", "work with it",
     "how does it work with", "how would it work with",
+    # Added 2026-08-25 (compound-turn testing): subject-position pronoun -- "how does IT
+    # integrate" (it = the thing just discussed) is a different construction from
+    # "integrate IT with" above (object-position) but carries the identical dependency.
+    "does it integrate", "would it integrate", "does that integrate", "would that integrate",
+    "does it combine", "would it combine", "does it connect", "would it connect",
+    "does it compare", "would it compare", "does it relate", "would it relate",
+    "how does it ", "how would it ", "how does that ", "how would that ",
     "walk me through the", "walk me through this", "walk me through that",
     "for the same", "the same time", "at the same time",
 )
@@ -413,6 +437,7 @@ class MeetingPipeline:
                 cleaned_pending_text = _strip_leading_repeated_filler(pending.text)
                 pending.text = f"{cleaned_pending_text} {transcript.text}".strip()
                 pending.end_time = transcript.end_time
+                wait_seconds = _QUESTION_DEBOUNCE_SECONDS
             elif (
                 pending is None
                 and self._last_answered is not None
@@ -445,16 +470,22 @@ class MeetingPipeline:
                     end_time=transcript.end_time,
                     language=transcript.language,
                 )
+                wait_seconds = _QUESTION_DEBOUNCE_SECONDS
             else:
-                # Genuinely new utterance. Whatever was pending never got answered, so it
-                # was almost certainly an incomplete fragment -- fold it in rather than
-                # dropping it silently. Strip a leading repeated-filler artifact first (see
-                # _strip_leading_repeated_filler).
+                # Genuinely new utterance, no in-flight ENHANCEMENT match. Two cases:
+                #   (a) pending is None -- the very first question in a while.
+                #   (b) pending is NOT None -- a previous question is still waiting out
+                #       ITS OWN merge window (below), and this is a second, likely-distinct
+                #       question arriving close behind it. Time-based compound grouping
+                #       (2026-08-25): fold it in rather than answering the first one alone.
+                # Either way this is a genuinely new-question event, so the wait before
+                # committing is the longer merge window, not the short fragment debounce --
+                # see _QUESTION_MERGE_WINDOW_SECONDS for the latency trade-off this implies.
                 if pending is not None:
-                    cleaned_pending_text = _strip_leading_repeated_filler(pending.text)
-                    transcript.text = f"{cleaned_pending_text} {transcript.text}".strip()
+                    transcript.text = self._format_pending_addition(pending.text, transcript)
                     transcript.start_time = pending.start_time
                 pending = transcript
+                wait_seconds = _QUESTION_MERGE_WINDOW_SECONDS
 
             # Only NOW is it worth interrupting: this segment genuinely changes the question.
             self._cancel_active_generation("question changed")
@@ -462,7 +493,7 @@ class MeetingPipeline:
                 self._debounce_task.cancel()
 
             self._pending_transcript = pending
-            self._debounce_task = asyncio.create_task(self._debounced_process())
+            self._debounce_task = asyncio.create_task(self._debounced_process(wait_seconds))
         except Exception:
             logger.exception("Error handling speech segment")
 
@@ -496,20 +527,53 @@ class MeetingPipeline:
         detected = self._question_detector.detect(transcript)
         return detected is not None and detected.has_interrogative_signal
 
+    def _format_pending_addition(self, old_text: str, new_transcript: Transcript) -> str:
+        """Join a newly-arrived segment onto a still-pending (undebounced) transcript.
+
+        Time-based compound-turn grouping, added 2026-08-25: if the new segment
+        independently reads as its own complete question (has its own interrogative
+        signal, no anaphoric dependency on old_text -- see _reads_as_independent_question),
+        this is very likely a genuinely SECOND question asked close behind the first, not a
+        continuation of the same one. Format it as an explicit numbered compound turn
+        ("Question 1: ... Question 2: ...") so the answer generator addresses both
+        distinctly, rather than a bare space-joined concatenation that reads as one
+        run-on/garbled sentence. A fragment continuation (old_text was cut off mid-thought,
+        or the new segment leans on "it"/"that") still gets the plain concatenation this
+        always did, since numbering a broken sentence would be wrong.
+        """
+        old_probe = Transcript(
+            speaker_id=new_transcript.speaker_id, text=old_text, start_time=0, end_time=0
+        )
+        both_are_questions = self._reads_as_independent_question(
+            new_transcript
+        ) and self._reads_as_independent_question(old_probe)
+        if not both_are_questions:
+            cleaned = _strip_leading_repeated_filler(old_text)
+            return f"{cleaned} {new_transcript.text}".strip()
+
+        existing_numbers = re.findall(r"^Question (\d+):", old_text, re.MULTILINE)
+        if existing_numbers:
+            # Already a compound turn (3rd+ question in the same grouping window) --
+            # append as the next number rather than restarting at 1.
+            next_n = int(existing_numbers[-1]) + 1
+            return f"{old_text}\nQuestion {next_n}: {new_transcript.text}"
+        return f"Question 1: {old_text}\nQuestion 2: {new_transcript.text}"
+
     def _cancel_active_generation(self, reason: str) -> None:
         if self._active_generation and not self._active_generation.done():
             self._active_generation.cancel()
             logger.info(f"Cancelled in-flight answer generation: {reason}")
 
-    async def _debounced_process(self) -> None:
-        """Wait a beat before committing to an answer.
-
-        This is the guard against answering half a question: if the interviewer is simply
-        pausing mid-sentence, the next segment arrives inside this window, cancels this
-        timer, and extends the pending question instead of producing a second answer.
+    async def _debounced_process(self, wait_seconds: float = _QUESTION_DEBOUNCE_SECONDS) -> None:
+        """Wait before committing to an answer -- either a short beat (guards against
+        answering half a question if the interviewer is pausing mid-sentence) or the
+        longer compound-question merge window (guards against answering the first of two
+        back-to-back questions before the second has had a chance to arrive and get
+        folded in -- see _QUESTION_MERGE_WINDOW_SECONDS). The caller decides which applies
+        per segment; either way, any new speech inside the window cancels this timer.
         """
         try:
-            await asyncio.sleep(_QUESTION_DEBOUNCE_SECONDS)
+            await asyncio.sleep(wait_seconds)
         except asyncio.CancelledError:
             return
 
@@ -673,9 +737,32 @@ class MeetingPipeline:
                 if conversation_context
                 else await self._cache.get_llm_response(question.transcript.text, chunk_texts)
             )
+            # Time-based compound-turn grouping (2026-08-25): _format_pending_addition
+            # marks a compound turn with literal "Question 1:"/"Question 2:" numbering.
+            # Detect that here and tell the model explicitly to answer all of them
+            # together in one natural response, rather than picking just one or writing
+            # them up as disconnected mini-essays.
+            compound_instruction = ""
+            compound_matches = re.findall(r"^Question (\d+):", question.transcript.text, re.MULTILINE)
+            if len(compound_matches) >= 2:
+                compound_instruction = (
+                    "\n\nCOMPOUND TURN -- the interviewer asked "
+                    f"{len(compound_matches)} questions in immediate succession (a few "
+                    "seconds apart), numbered above. Answer ALL of them, in one natural "
+                    "flowing response as a candidate would actually speak it -- not "
+                    "'Answer 1: ... Answer 2: ...' unless the questions are complex enough "
+                    "that explicit separation genuinely improves clarity. Do not ignore any "
+                    "of them and do not answer only the last one. If a later question "
+                    "explicitly says to forget/ignore the earlier one or pivots to a "
+                    "clearly different scenario (\"forget that\", \"different scenario\", "
+                    "\"let's design something else\"), respect that pivot -- don't force "
+                    "an artificial connection between unrelated questions just because they "
+                    "arrived in the same turn.\n"
+                )
             system_prompt = (
                 build_system_prompt(question_text=question.transcript.text)
                 + conversation_context
+                + compound_instruction
             )
             q_prefix = f"**Q:** {question.transcript.text}\n\n---\n\n"
             if cached_text is not None:
