@@ -53,7 +53,10 @@ _FRAGMENT_MERGE_GAP_SECONDS = 3.0
 # we've usually already answered -- so within this longer window we re-answer the COMBINED
 # question and supersede the previous answer on the overlay, rather than answering the
 # addition in isolation with no idea what it refers to.
-_SUPERSEDE_WINDOW_SECONDS = 15.0
+_SUPERSEDE_WINDOW_SECONDS = 35.0  # was 15.0 -- too short for a genuine thinking pause.
+# Observed live 2026-08-25: "tell me about Terraform" [~30s pause] "how can you integrate
+# it with Agentic AI" was answered as two disconnected questions instead of one merged
+# answer, because the real-world pause exceeded the old 15s window.
 
 # An interviewer describing a multi-sentence scenario ("Two services show correlated
 # anomalies with no dependency between them... a BigPanda alert fires for the payment
@@ -113,6 +116,13 @@ _ANAPHORA_MARKERS = (
     "for this", "for that", "with this", "with that", "in this case", "in that case",
     "using this", "using that", "on this", "on that", "from this", "from that",
     "this approach", "that approach", "this one", "that one", "this way",
+    # Added 2026-08-25: bare pronoun objects on a dependency verb ("integrate IT with...",
+    # "combine IT with...") -- these carry the same "refers to something already said"
+    # signal as "with this"/"with that" above but without that exact phrase, and were
+    # observed live merging incorrectly because of it.
+    "integrate it", "integrate that", "combine it", "combine that", "connect it",
+    "connect that", "extend it", "extend that", "use it with", "work with it",
+    "how does it work with", "how would it work with",
     "walk me through the", "walk me through this", "walk me through that",
     "for the same", "the same time", "at the same time",
 )
@@ -463,13 +473,26 @@ class MeetingPipeline:
 
         Observed live 2026-08-13, twice in one session: "Tell me about yourself" was
         answered, then "Have you designed any kind of agent-KI automation?" (and later
-        "Can I explain the Agentic AI solution...") arrived inside the 15s supersede
-        window and got merged into the FIRST question's text, because
-        _is_question_enhancement only refuses to merge when the new segment uses an
-        explicit transition phrase ("next question", "moving on") -- real interviewers
-        almost never say those, they just ask the next question directly. Checking the
-        segment's own interrogative strength catches this regardless of phrasing.
+        "Can I explain the Agentic AI solution...") arrived inside the supersede window
+        and got merged into the FIRST question's text, because _is_question_enhancement
+        only refuses to merge when the new segment uses an explicit transition phrase
+        ("next question", "moving on") -- real interviewers almost never say those, they
+        just ask the next question directly. Checking the segment's own interrogative
+        strength catches this regardless of phrasing.
+
+        EXCEPTION -- anaphoric dependency wins over interrogative shape. Observed live
+        2026-08-25: "tell me about Terraform" [pause] "how can you integrate it with
+        Agentic AI" was treated as independent (it starts with "how", has a "?") and
+        answered as a disconnected second question, when it's clearly a continuation --
+        "integrate IT" only means something with the prior turn's topic as antecedent. A
+        sentence can be grammatically a complete question and still be semantically
+        dependent on what was just said; the anaphora check catches the case the bare
+        interrogative check cannot. An explicit new-topic opener (_NEW_QUESTION_OPENERS)
+        still wins over both -- that's handled by the caller via _looks_like_new_question.
         """
+        lowered = transcript.text.lower().strip()
+        if any(m in lowered for m in _ANAPHORA_MARKERS):
+            return False
         detected = self._question_detector.detect(transcript)
         return detected is not None and detected.has_interrogative_signal
 
