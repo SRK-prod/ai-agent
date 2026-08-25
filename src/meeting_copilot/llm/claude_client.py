@@ -68,12 +68,25 @@ async def _stream_with_retry(
 class _ClaudeBackend(Protocol):
     async def complete(self, prompt: str, system: str | None = None) -> str: ...
     def stream(self, prompt: str, system: str | None = None) -> AsyncIterator[str]: ...
+    def last_usage(self) -> tuple[int, int] | None:
+        """(input_tokens, output_tokens) for the most recently completed stream()/complete()
+        call, or None if unavailable for this backend. Best-effort -- lets the orchestrator's
+        per-question latency log include token counts (large prompts are a real TTFT lever)
+        without every backend needing to support it."""
+        ...
 
 
 class ClaudeCliBackend:
     def __init__(self, config: LlmConfig):
         self._cfg = config
         self._session_id: str | None = None
+
+    def last_usage(self) -> tuple[int, int] | None:
+        # Not implemented for the CLI backend -- the subprocess JSON events don't carry a
+        # consistent token-usage field across CLI versions, and this backend isn't the
+        # active default (llm.backend=api). Add if/when this backend needs the same
+        # per-question token visibility.
+        return None
 
     async def complete(self, prompt: str, system: str | None = None) -> str:
         cmd = [self._cfg.cli_binary, "-p", prompt, "--output-format", "json"]
@@ -152,6 +165,10 @@ class ClaudeApiBackend:
         self._cfg = config
         api_key = get_config().secrets.require_anthropic_key()
         self._client = anthropic.AsyncAnthropic(api_key=api_key)
+        self._last_usage: tuple[int, int] | None = None
+
+    def last_usage(self) -> tuple[int, int] | None:
+        return self._last_usage
 
     def _system_blocks(self, system: str | None):
         if not system:
@@ -170,6 +187,7 @@ class ClaudeApiBackend:
                     system=self._system_blocks(system),
                     messages=[{"role": "user", "content": prompt}],
                 )
+                self._last_usage = (response.usage.input_tokens, response.usage.output_tokens)
                 return "".join(
                     block.text for block in response.content if block.type == "text"
                 ).strip()
@@ -191,6 +209,11 @@ class ClaudeApiBackend:
         ) as stream:
             async for text in stream.text_stream:
                 yield text
+            # Prompt size is a real TTFT lever (see orchestrator's per-question latency
+            # log) -- final_message carries the actual usage for this call, only available
+            # once the stream is done, so this can't be captured earlier.
+            final = await stream.get_final_message()
+            self._last_usage = (final.usage.input_tokens, final.usage.output_tokens)
 
     def stream(self, prompt: str, system: str | None = None) -> AsyncIterator[str]:
         return _stream_with_retry(self._raw_stream, prompt, system)
@@ -208,6 +231,12 @@ class OpenAiApiBackend:
         self._cfg = config
         api_key = get_config().secrets.require_openai_key()
         self._client = AsyncOpenAI(api_key=api_key)
+
+    def last_usage(self) -> tuple[int, int] | None:
+        # Not implemented -- would need stream_options={"include_usage": True} on the
+        # streaming call. Not the active default backend (llm.backend=api); add if/when
+        # this one needs the same per-question token visibility.
+        return None
 
     def _messages(self, prompt: str, system: str | None):
         messages = []
@@ -266,6 +295,11 @@ class ClaudeClient:
         else:
             raise ValueError(f"Unknown llm.backend: {self._cfg.backend!r}")
         logger.info(f"ClaudeClient using backend={self._cfg.backend}")
+
+    def last_usage(self) -> tuple[int, int] | None:
+        """(input_tokens, output_tokens) for the most recently completed call, or None if
+        the active backend doesn't support it -- see _ClaudeBackend.last_usage."""
+        return self._backend.last_usage()
 
     async def complete(self, prompt: str, system: str | None = None) -> str:
         return await self._backend.complete(prompt, system)

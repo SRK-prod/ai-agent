@@ -35,7 +35,12 @@ from meeting_copilot.pipeline.events import (
     SpeechSegment,
     Transcript,
 )
-from meeting_copilot.pipeline.metrics import PIPELINE_TOTAL_LATENCY_SECONDS, StageTimer
+from meeting_copilot.pipeline.metrics import (
+    LLM_TTFT_SECONDS,
+    PIPELINE_TOTAL_LATENCY_SECONDS,
+    TTFA_SECONDS,
+    StageTimer,
+)
 from meeting_copilot.retrieval.hybrid_search import HybridSearcher
 from meeting_copilot.retrieval.qa_bank import QaBankStore
 from meeting_copilot.speaker.diarization import SpeakerDiarizer
@@ -98,12 +103,22 @@ _SCENARIO_CONTEXT_WINDOW_SECONDS = 25.0
 # answering half a question when the interviewer is mid-thought ("...how would you design
 # an AIOps platform" [2s] "...for a bank with 10,000 services?"). Any new speech inside
 # this window cancels the timer and extends the question instead of starting a 2nd answer.
-# Kept deliberately short -- this is added directly to time-to-first-token.
+# Kept deliberately short -- this is added directly to time-to-first-token, on EVERY
+# question, guaranteed.
 # Measured live 2026-08-13: generation itself is fast (TTFA 0.8-1.4s), but VAD silence
 # (1.0s) + debounce was adding ~2.2s of dead air BEFORE generation started -- the delay the
-# candidate actually feels. Cut to 0.5s: the supersede path already re-answers late
-# additions, so a long debounce is largely redundant protection paid for on every question.
-_QUESTION_DEBOUNCE_SECONDS = 0.5
+# candidate actually feels. Cut to 0.5s then.
+# Cut further 2026-08-25 after the TTFA instrumentation (metrics.py TTFA_SECONDS) showed
+# this fixed 500ms was the single most deterministic, cheapest-to-remove chunk of the
+# ~1.7-2.4s real pipeline: STT ~400-600ms + this 500ms + Claude TTFT ~800-1300ms. Not
+# removed entirely -- fragmented STT ("What is Terraform" / "and how" / "have you used
+# it?") still needs SOME window to merge back into one question before answering; this is
+# not the ANSWER REVISION WINDOW (which handles a fully separate, already-answered question
+# arriving later) but the guard against answering a mid-utterance fragment as if it were
+# the whole question. Verified against a live-pipeline test at this value before landing:
+# fragment merging and the answer revision window both still work correctly (see
+# scratchpad test run referenced in the commit).
+_QUESTION_DEBOUNCE_SECONDS = 0.2
 
 # How many (question, answer) pairs to keep for follow-up context.
 _CONVERSATION_MEMORY_TURNS = 3
@@ -416,6 +431,13 @@ class MeetingPipeline:
         # paused-and-continued utterance, not a multi-sentence scenario walkthrough.
         self._scenario_context_text: str = ""
         self._scenario_context_end_time: float = 0.0
+        # STT duration for the segment most recently handled -- read back in
+        # _process_transcript to fold into the per-question latency breakdown. Passed via
+        # instance state rather than a return value because _handle_segment's result can
+        # take several different paths (fragment merge, revision, genuinely new) before
+        # _process_transcript is eventually invoked, sometimes turns later -- see
+        # _handle_segment's own "started_at" for why the SAME pattern is used for TTFA.
+        self._last_stt_seconds: float = 0.0
 
     async def _handle_segment(self, segment: SpeechSegment) -> None:
         """Turn a speech segment into pending question text, then (re)start the debounce.
@@ -424,14 +446,21 @@ class MeetingPipeline:
         an interviewer who keeps talking (a pause mid-question, or an added qualifier)
         updates the same pending question instead of triggering a second answer.
         """
+        # TTFA is measured from HERE -- the moment this segment is ready to handle, before
+        # diarize/STT even run -- not from when _process_transcript happens to start. That
+        # earlier, narrower definition undercounted real perceived latency by excluding
+        # diarize+STT+debounce entirely. Threaded through _debounced_process ->
+        # _process_transcript below.
+        started_at = time.monotonic()
         try:
             with StageTimer("speaker_id"):
                 diarized = await asyncio.to_thread(self._diarizer.diarize, segment)
             if diarized.is_me:
                 return
 
-            with StageTimer("stt"):
+            with StageTimer("stt") as stt_timer:
                 transcript = await self._stt.transcribe(diarized)
+            self._last_stt_seconds = stt_timer.elapsed_seconds
             if transcript is None:
                 return
 
@@ -522,7 +551,9 @@ class MeetingPipeline:
                 self._debounce_task.cancel()
 
             self._pending_transcript = pending
-            self._debounce_task = asyncio.create_task(self._debounced_process(wait_seconds))
+            self._debounce_task = asyncio.create_task(
+                self._debounced_process(wait_seconds, started_at)
+            )
         except Exception:
             logger.exception("Error handling speech segment")
 
@@ -597,13 +628,19 @@ class MeetingPipeline:
             self._active_generation.cancel()
             logger.info(f"Cancelled in-flight answer generation: {reason}")
 
-    async def _debounced_process(self, wait_seconds: float = _QUESTION_DEBOUNCE_SECONDS) -> None:
+    async def _debounced_process(
+        self, wait_seconds: float = _QUESTION_DEBOUNCE_SECONDS, started_at: float = 0.0
+    ) -> None:
         """Wait a short beat before committing to an answer -- guards against answering half
         a question if the interviewer is pausing mid-sentence. Any new speech inside the
         window cancels this timer and extends the pending question instead. Deliberately
         always short: compound-question grouping happens AFTER an answer exists, via the
         answer revision window (_ANSWER_REVISION_WINDOW_SECONDS), not by delaying the first
         answer.
+
+        started_at: passed through from _handle_segment (the moment THIS segment became
+        ready to handle) so the eventual TTFA measurement in _process_transcript covers the
+        real pipeline -- diarize+STT+this debounce+generation -- not just generation.
         """
         try:
             await asyncio.sleep(wait_seconds)
@@ -617,15 +654,18 @@ class MeetingPipeline:
         self._generation_seq += 1
         gen_id = self._generation_seq
         self._active_generation = asyncio.create_task(
-            self._process_transcript(transcript, gen_id)
+            self._process_transcript(transcript, gen_id, started_at or time.monotonic())
         )
         try:
             await self._active_generation
         except asyncio.CancelledError:
             logger.debug("Answer generation cancelled before completion")
 
-    async def _process_transcript(self, transcript: Transcript, gen_id: int = 0) -> None:
-        started_at = time.monotonic()
+    async def _process_transcript(
+        self, transcript: Transcript, gen_id: int = 0, started_at: float | None = None
+    ) -> None:
+        started_at = started_at if started_at is not None else time.monotonic()
+        stt_seconds = self._last_stt_seconds
 
         def is_current() -> bool:
             """False once a newer question has superseded this generation."""
@@ -792,16 +832,42 @@ class MeetingPipeline:
                     "an artificial connection between unrelated questions just because they "
                     "arrived in the same turn.\n"
                 )
-            system_prompt = (
-                build_system_prompt(question_text=question.transcript.text)
-                + conversation_context
-                + compound_instruction
-            )
+            # "classification" (_classify_category inside build_system_prompt) is cheap
+            # deterministic string matching, not an LLM call -- folded into this one
+            # "context_prep" stage rather than split out, since separately timing a
+            # sub-millisecond string match would just add noise to the breakdown.
+            with StageTimer("context_prep") as context_timer:
+                system_prompt = (
+                    build_system_prompt(question_text=question.transcript.text)
+                    + conversation_context
+                    + compound_instruction
+                )
             q_prefix = f"**Q:** {question.transcript.text}\n\n---\n\n"
+            llm_ttft_seconds = 0.0
+
+            def _log_ttfa(first_token_at: float) -> None:
+                # TIME TO FIRST USEFUL ANSWER -- the metric that actually decides whether
+                # this is usable live. Everything before this point is dead air the
+                # candidate is standing in. Logged once, whether the answer came from a
+                # cache hit (near-instant) or a real generation, so the breakdown is
+                # comparable across both.
+                ttfa_seconds = first_token_at - started_at
+                TTFA_SECONDS.observe(ttfa_seconds)
+                turn = "first" if self._revision_count <= 1 else f"revision{self._revision_count}"
+                logger.info(
+                    f"Q{gen_id} turn={turn} stt={stt_seconds * 1000:.0f}ms "
+                    f"context={context_timer.elapsed_seconds * 1000:.0f}ms "
+                    f"llm_ttft={llm_ttft_seconds * 1000:.0f}ms "
+                    f"TTFA={ttfa_seconds * 1000:.0f}ms "
+                    f"q={question.transcript.text!r}"
+                )
+
             if cached_text is not None:
                 raw_text = cached_text
+                _log_ttfa(time.monotonic())
             else:
                 raw_text = ""
+                llm_call_started_at = time.monotonic()
                 with StageTimer("llm"):
                     first_token_at: float | None = None
                     async for delta in self._claude.stream(
@@ -810,14 +876,9 @@ class MeetingPipeline:
                         raw_text += delta
                         if first_token_at is None:
                             first_token_at = time.monotonic()
-                            # TIME TO FIRST USEFUL ANSWER -- the metric that actually decides
-                            # whether this is usable live. Everything before this point is
-                            # dead air the candidate is standing in.
-                            logger.info(
-                                f"TTFA {first_token_at - started_at:.2f}s "
-                                f"(debounce {_QUESTION_DEBOUNCE_SECONDS}s excluded) "
-                                f"q={question.transcript.text!r}"
-                            )
+                            llm_ttft_seconds = first_token_at - llm_call_started_at
+                            LLM_TTFT_SECONDS.observe(llm_ttft_seconds)
+                            _log_ttfa(first_token_at)
                         if not is_current():
                             logger.debug("Stale generation -- dropping partial")
                             return
@@ -847,7 +908,8 @@ class MeetingPipeline:
                 if is_current() and self._on_partial_answer:
                     await self._on_partial_answer(q_prefix + raw_text)
 
-            answer = self._optimizer.optimize(context, raw_text)
+            with StageTimer("optimizer") as optimizer_timer:
+                answer = self._optimizer.optimize(context, raw_text)
             PIPELINE_TOTAL_LATENCY_SECONDS.observe(time.monotonic() - started_at)
 
             # Record the exchange so the NEXT drill-down has something to build on.
@@ -856,7 +918,21 @@ class MeetingPipeline:
                 self._conversation.pop(0)
 
             if self._on_answer and is_current():
-                await self._on_answer(answer)
+                with StageTimer("overlay_delivery") as overlay_timer:
+                    await self._on_answer(answer)
+                usage = self._claude.last_usage()
+                turn = "first" if self._revision_count <= 1 else f"revision{self._revision_count}"
+                usage_str = (
+                    f"input_tokens={usage[0]} output_tokens={usage[1]} "
+                    if usage is not None
+                    else ""
+                )
+                logger.info(
+                    f"Q{gen_id} turn={turn} {usage_str}"
+                    f"optimizer={optimizer_timer.elapsed_seconds * 1000:.0f}ms "
+                    f"overlay={overlay_timer.elapsed_seconds * 1000:.0f}ms "
+                    f"total={(time.monotonic() - started_at) * 1000:.0f}ms"
+                )
         except asyncio.CancelledError:
             logger.debug("Generation cancelled mid-answer (interviewer spoke)")
             raise
