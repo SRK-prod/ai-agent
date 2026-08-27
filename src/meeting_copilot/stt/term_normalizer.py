@@ -189,6 +189,12 @@ _PHRASE_FIXES: dict[str, str] = {
     "agent decay": "Agentic AI",
     "agentic decay": "Agentic AI",
     "urgent decay": "Agentic AI",
+    # "AIG" observed live 2026-08-27: Whisper heard "Agentic AI" as this 3-letter clip,
+    # which then read as a plausible real (if unrelated) acronym rather than obvious noise
+    # -- the model asked for clarification instead of resolving it. Fixed at the source: by
+    # the time the LLM sees the text, it should already read "Agentic AI".
+    "aig": "Agentic AI",
+    "a i g": "Agentic AI",
     "bed rock": "Bedrock",
     "bedrock": "Bedrock",
     "sage maker": "SageMaker",
