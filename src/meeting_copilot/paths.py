@@ -7,6 +7,7 @@ mutable per-user state (data/, logs/, .env) moves to
 never needs to write inside itself.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -32,7 +33,7 @@ _USER_ROOT = _user_data_root()
 DATA_DIR = _USER_ROOT / "data"
 LOGS_DIR = _USER_ROOT / "logs"
 
-SETTINGS_FILE = CONFIGS_DIR / "settings.yaml"
+SETTINGS_FILE = CONFIGS_DIR / os.environ.get("MEETING_COPILOT_SETTINGS_FILE", "settings.yaml")
 LOGGING_FILE = CONFIGS_DIR / "logging.yaml"
 TOPICS_FILE = CONFIGS_DIR / "topics.yaml"
 ENV_FILE = _USER_ROOT / ".env"

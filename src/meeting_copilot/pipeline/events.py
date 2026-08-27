@@ -90,3 +90,32 @@ class Answer:
     format_type: str  # "prose" | "bullets" | "code" | "table"
     confidence: float
     low_confidence: bool
+
+
+@dataclass
+class AudioHealth:
+    """Point-in-time read of whether the audio CAPTURE INFRASTRUCTURE is actually working --
+    see audio/capture.py AudioCapture.health(). Answers "can this still hear the
+    interviewer if they speak", not "has the interviewer spoken recently" -- this capture
+    stream carries only the interviewer's side (BlackHole/system audio), so it is silent for
+    the entire time the candidate is answering (routinely 30s-several minutes), which is
+    normal and must never by itself read as a failure. Confirmed live 2026-08-25: an
+    earlier version that escalated on silence DURATION produced 7 false AUDIO_INPUT_LOST
+    warnings in one ~11-minute session, every one recovering the instant the interviewer
+    spoke again.
+    """
+
+    state: str  # "AUDIO_ACTIVE" | "AUDIO_SILENT" | "AUDIO_INPUT_LOST"
+    # AUDIO_ACTIVE: None. AUDIO_SILENT: "NO_INTERVIEWER_SPEECH" -- informational, not an
+    # error; can legitimately last minutes. AUDIO_INPUT_LOST: "CALLBACK_STALLED" (the
+    # capture callback itself stopped firing) | "DEVICE_UNAVAILABLE" (the configured input
+    # device is gone) | "DEVICE_CHANGED" (that device index now belongs to a different
+    # device -- CoreAudio renumbering, e.g. after a Bluetooth device connects). Not shown in
+    # the overlay, logged on every state transition -- this is exactly the detail that was
+    # missing to diagnose past live dropouts after the fact.
+    reason: str | None
+    seconds_since_signal: float
+    seconds_since_callback: float
+    last_peak: float
+    last_rms: float
+    callback_count: int

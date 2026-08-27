@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 
+import numpy as np
 import torch
 from faster_whisper import WhisperModel
 
@@ -60,18 +61,55 @@ class FasterWhisperEngine:
         return " ".join(s.text.strip() for s in segments).strip()
 
 
+# Measured 2026-08-26 on this project's dev machine: pure digital silence (all-zero
+# samples) fed to large-v3-turbo still hallucinates text ('and the other one.') and pays
+# the model's full ~2.3-2.7s encoder floor to produce it -- Whisper always encodes a fixed
+# 30s window internally regardless of how little real signal is in it. RMS this low is
+# below any audible real speech (quiet real speech measured well above 0.01), so skipping
+# the STT call entirely here is safe: it only short-circuits segments that were never
+# going to produce real content, saving the wasted decode time and preventing the
+# hallucinated text from ever reaching the question detector.
+_SILENCE_RMS_THRESHOLD = 0.003
+
+
+def _is_near_silent(samples: np.ndarray) -> bool:
+    if samples.size == 0:
+        return True
+    rms = float(np.sqrt(np.mean(np.square(samples, dtype=np.float64))))
+    return rms < _SILENCE_RMS_THRESHOLD
+
+
 def _is_hallucinated(text: str) -> bool:
     """Whisper's most common failure mode on noisy/cross-talk/low-signal audio isn't
     silence -- it's a repetition loop, the same word or short phrase output dozens of
     times ('Disability Disability Disability...', 'diss diss diss...'). Real speech
     essentially never repeats one word this often, so a high repetition ratio is a
     reliable signal to discard the segment rather than treat it as real content."""
-    words = text.split()
+    words = [w.lower().strip(".,!?") for w in text.split()]
     if len(words) < 6:
         return False
-    counts = Counter(w.lower().strip(".,!?") for w in words)
+
+    # Single-word repetition loop ("create create create...").
+    counts = Counter(words)
     _most_common_word, most_common_count = counts.most_common(1)[0]
-    return most_common_count >= 5 and most_common_count / len(words) > 0.35
+    if most_common_count >= 5 and most_common_count / len(words) > 0.35:
+        return True
+
+    # Short-PHRASE repetition loop ("the other one, the other one, ..." / "I could be
+    # red, or I could be red, or ..."). Added 2026-08-26 after live review: a 2-5 word
+    # repeating phrase dilutes any single word's frequency below the check above even
+    # though the same phrase dominates the transcript -- e.g. a 3-word phrase repeated
+    # puts each word at ~33% of total words, just under the 35% cutoff. Check n-grams of
+    # length 2-5 for the same "one repeated unit covers most of the text" signal.
+    for n in (2, 3, 4, 5):
+        if len(words) < n * 3:  # need at least 3 repeats to call it a loop
+            continue
+        ngram_counts = Counter(tuple(words[i : i + n]) for i in range(len(words) - n + 1))
+        _phrase, phrase_count = ngram_counts.most_common(1)[0]
+        if phrase_count >= 4 and (phrase_count * n) / len(words) > 0.5:
+            return True
+
+    return False
 
 
 def get_stt_engine(config: SttConfig | None = None):
@@ -95,6 +133,14 @@ class SttStage:
         if diarized.is_me:
             return None
 
+        if _is_near_silent(diarized.segment.samples):
+            # Skip the expensive model call entirely -- near-silent audio (VAD passed it
+            # through, but there's effectively no signal) still costs Whisper's full
+            # ~2.3-2.7s encoder floor AND reliably hallucinates fake text from it, which
+            # was cascading into false question-revision triggers downstream.
+            logger.debug("Skipping STT on near-silent segment (below RMS threshold)")
+            return None
+
         text = await asyncio.to_thread(
             self._engine.transcribe_samples,
             diarized.segment.samples,
@@ -104,7 +150,10 @@ class SttStage:
             return None
 
         if _is_hallucinated(text):
-            logger.warning(f"Discarding likely STT hallucination: {text[:80]!r}...")
+            # Full text, not truncated -- a discard is a real interview question silently
+            # dropped if this is ever wrong, so this needs to be verifiable from the log
+            # alone rather than requiring the reader to re-run the classifier by hand.
+            logger.warning(f"Discarding likely STT hallucination: {text!r}")
             return None
 
         # Repair mis-transcribed technical vocabulary BEFORE question detection. Whisper

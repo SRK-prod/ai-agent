@@ -17,7 +17,7 @@ from fastapi.responses import Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 
-from meeting_copilot.pipeline.events import Answer
+from meeting_copilot.pipeline.events import Answer, AudioHealth
 from meeting_copilot.pipeline.orchestrator import MeetingPipeline
 from meeting_copilot.speaker.enrollment import enroll_interactive
 from meeting_copilot.utils.logging import get_logger
@@ -43,6 +43,14 @@ class ConnectionManager:
     async def broadcast_partial_answer(self, text_so_far: str) -> None:
         await self._broadcast({"type": "answer_partial", "data": {"text": text_so_far}})
 
+    async def broadcast_audio_health(self, health: AudioHealth) -> None:
+        # Only state/reason go to the overlay -- raw RMS/peak/callback counts are
+        # debug detail, already logged server-side on every transition (see
+        # MeetingPipeline._watchdog_loop), not something the overlay UI displays.
+        await self._broadcast(
+            {"type": "audio_health", "data": {"state": health.state, "reason": health.reason}}
+        )
+
     async def _broadcast(self, message: dict) -> None:
         stale: list[WebSocket] = []
         for ws in self._connections:
@@ -65,6 +73,7 @@ async def lifespan(app: FastAPI):
         _pipeline = MeetingPipeline(
             on_answer=connections.broadcast_answer,
             on_partial_answer=connections.broadcast_partial_answer,
+            on_audio_health=connections.broadcast_audio_health,
         )
         _pipeline.start()
         logger.info("MeetingPipeline auto-started on backend boot")
@@ -113,6 +122,15 @@ async def enroll(req: EnrollRequest) -> dict:
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket) -> None:
     await connections.connect(websocket)
+    # Audio health is only broadcast on a state TRANSITION (see MeetingPipeline._watchdog_
+    # loop), so a client connecting between two transitions would otherwise never learn the
+    # current state until the next one happens to fire. Send it directly to just this new
+    # connection so the overlay is never blind to an already-in-progress AUDIO_INPUT_LOST.
+    if _pipeline is not None:
+        health = _pipeline.audio_health()
+        await websocket.send_json(
+            {"type": "audio_health", "data": {"state": health.state, "reason": health.reason}}
+        )
     try:
         while True:
             await websocket.receive_text()  # overlay currently only receives; ignore any input
