@@ -26,7 +26,11 @@ from meeting_copilot.config import get_config
 from meeting_copilot.knowledge.embeddings import LocalEmbedder
 from meeting_copilot.llm.answer_optimizer import AnswerOptimizer
 from meeting_copilot.llm.claude_client import ClaudeClient
-from meeting_copilot.llm.prompt_templates import build_system_prompt, build_user_prompt
+from meeting_copilot.llm.prompt_templates import (
+    _classify_category,
+    build_system_prompt,
+    build_user_prompt,
+)
 from meeting_copilot.nlp.question_detector import get_question_detector
 from meeting_copilot.pipeline.events import (
     Answer,
@@ -369,6 +373,52 @@ def _looks_like_new_question(text: str) -> bool:
                for opener in _NEW_QUESTION_OPENERS)
 
 
+# _classify_category's catch-all bucket -- landing here on its own says nothing reliable
+# about topic (many genuinely different real questions share it purely because they don't
+# hit a specific keyword), so it can't be trusted for a same/different comparison the way a
+# specific category can.
+_TOPIC_AMBIGUOUS_CATEGORY = "default"
+
+# A genuinely additive follow-up ("...for a bank with 10,000 services?", "...specifically for
+# a payment service?") is almost always short -- it leans on the previous question for its
+# subject and just adds a qualifier. Used only as the fallback signal when category alone
+# can't decide (see _is_topic_change).
+_MIN_WORDS_FOR_STANDALONE_QUESTION = 8
+
+
+def _is_topic_change(new_text: str, previous_text: str) -> bool:
+    """Cheap, deterministic topic-discontinuity signal, complementing (never replacing)
+    _looks_like_new_question. That phrase-based check only catches a topic change when the
+    interviewer explicitly narrates the transition ('next question', 'let's move on') --
+    measured live 2026-08-27: three genuinely unrelated questions asked back-to-back with no
+    such marker ('tell me about yourself' -> 'AWS multi-zone landing setup' -> 'telemetry in
+    the DevOps system') all got merged into one 22-second, 1356-token mega-answer, because
+    none of them used a marker phrase.
+
+    Two-tier signal, in priority order:
+    1. If BOTH the new and previous question land in a specific (non-'default') category,
+       trust that directly -- a category match ('design HA' -> 'how would you handle
+       failover specifically for a payment service', both ha_dr) means stay merged
+       regardless of length; a mismatch ('what is Kubernetes' -> 'tell me about yourself',
+       definition vs career_narrative) means split even if both are short.
+    2. Otherwise (either side landed in the 'default' catch-all, which carries no reliable
+       topic signal on its own -- measured live: both real unrelated follow-ups above landed
+       here) fall back to length: a substantial, grammatically complete question is far more
+       likely to be the interviewer's next prepared question than a trailing qualifier.
+
+    A false split here is safe: conversation context still attaches by default (see the
+    ATTACH BY DEFAULT block above) regardless of merge-vs-split, so a genuinely connected
+    follow-up that splits anyway still gets answered with full awareness of the prior turn,
+    just as its own answer instead of a merged rewrite. A false MERGE is the expensive
+    failure (a confused multi-topic answer taking 20+ seconds), so this is deliberately
+    biased toward splitting when uncertain."""
+    new_category = _classify_category(new_text)
+    previous_category = _classify_category(previous_text)
+    if new_category != _TOPIC_AMBIGUOUS_CATEGORY and previous_category != _TOPIC_AMBIGUOUS_CATEGORY:
+        return new_category != previous_category
+    return len(new_text.split()) >= _MIN_WORDS_FOR_STANDALONE_QUESTION
+
+
 def _is_question_enhancement(text: str) -> bool:
     """True when this looks like added detail on the SAME question, not a new topic.
 
@@ -532,19 +582,24 @@ class MeetingPipeline:
                 and (transcript.start_time - self._last_answered.end_time)
                 < _ANSWER_REVISION_WINDOW_SECONDS
                 and _is_question_enhancement(transcript.text)  # no explicit pivot phrase
+                and not _is_topic_change(transcript.text, self._last_answered.text)
                 and self._revision_count < _MAX_REVISION_QUESTIONS
             ):
                 # ANSWER REVISION: we already answered, and within the revision window the
-                # same speaker either (a) added detail to the SAME question -- "how would
-                # you design event correlation?" [pause] "specifically across Splunk and
-                # Prometheus in a bank" -- or (b) asked a genuinely NEW question -- "What is
-                # Terraform?" [3s] "How should you have integrated AI?". Both cases fold into
-                # the SAME answer: re-answer the combined question set and replace the
-                # previous answer on the overlay, rather than leaving the addition unanswered
-                # or starting a disconnected second answer. _format_pending_addition tells
-                # the two cases apart (numbered "Question 1:/Question 2:" for a genuinely
-                # independent new question, plain concatenation for a same-question addition)
-                # -- see its docstring.
+                # same speaker added detail to the SAME question or asked a short, clearly
+                # connected follow-up -- "how would you design event correlation?" [pause]
+                # "specifically across Splunk and Prometheus in a bank". Both fold into the
+                # SAME answer: re-answer the combined question set and replace the previous
+                # answer on the overlay. A genuinely NEW, unrelated question inside this same
+                # window (caught by _is_topic_change above, since it rarely comes with an
+                # explicit pivot phrase) does NOT reach this branch -- it starts its own fresh
+                # turn instead, still with conversation context attached. Corrected 2026-08-27
+                # after live use: this branch used to fold ANY non-explicitly-pivoted question
+                # in here regardless of topic, so three unrelated real interview questions
+                # merged into one 22s/1356-token mega-answer. _format_pending_addition tells
+                # apart a genuinely independent new question that still belongs in this branch
+                # (numbered "Question 1:/Question 2:") from a same-question addition (plain
+                # concatenation) -- see its docstring.
                 merged_text = self._format_pending_addition(self._last_answered.text, transcript)
                 # Guard against re-answering the same thing forever. Whisper re-emits
                 # near-identical text for echo/noise tails, and without this the merged
