@@ -42,6 +42,13 @@ def _classify_category(question_text: str) -> str:
                          "fails closed", "fails open", "single point of failure")):
         return "failure_negative"
 
+    # Live production incident, sudden-change framing -- checked before cost_finops/
+    # scalability so e.g. "AWS costs suddenly increased" is triaged as an incident
+    # (Situation -> Investigation -> Root Cause -> Mitigation), not answered as a FinOps
+    # cost-optimization design question. Added 2026-08-26.
+    if re.search(r"\b(suddenly|unexpectedly)\s+(increased|spiked|dropped|doubled)\b", t):
+        return "scenario_troubleshooting"
+
     # Migration
     if any(m in t for m in ("migrate", "migration", "move from", "moving from", "port from",
                             "lift and shift", "rehost", "replatform", "cut over", "cutover")):
@@ -50,7 +57,9 @@ def _classify_category(question_text: str) -> str:
     # HA / DR -- checked before generic aws/architecture so RTO/RPO framing wins
     if any(m in t for m in ("high availability", "highly available", "disaster recovery",
                             " dr ", "rto", "rpo", "failover", "multi-region", "multi region",
-                            "active-active", "active-passive", "business continuity")):
+                            "active-active", "active-passive", "business continuity",
+                            # Added 2026-08-26.
+                            "single point of failure", "single points of failure", "spof")):
         return "ha_dr"
 
     # Scalability / performance
@@ -81,6 +90,13 @@ def _classify_category(question_text: str) -> str:
     # "choose X over Y" / "pick X over Y" / "prefer X over Y" -- another common trade-off
     # phrasing that doesn't use "vs" or "when would you use".
     if re.search(r"\b(choose|pick|prefer|go with)\b.+\bover\b", t):
+        return "trade_off"
+
+    # "X instead of Y" -- e.g. "Why Terraform instead of CloudFormation?", "Why Kubernetes
+    # instead of ECS?". Added 2026-08-26: this exact phrasing fell through to a bare
+    # domain-keyword match (e.g. landed in "aws" via "cloudformation") because only the
+    # "over" form above was covered.
+    if re.search(r"\binstead of\b", t):
         return "trade_off"
 
     # "run one X from another", "call one X from another" etc. -- implicitly asks for every
@@ -117,6 +133,10 @@ def _classify_category(question_text: str) -> str:
         "disagreement with", "disagree with", "senior stakeholder", "manage stakeholder",
         "stakeholder buy-in", "push back on a", "convince the team", "convince your team",
         "technical debt prioriti", "say no to", "onboarding engineers",
+        # Added 2026-08-26: "tell me about a difficult X" (decision, trade-off, call) is a
+        # STAR-shaped behavioral opener distinct from the narrower "tell me about a
+        # conflict/challenge/failure/mistake" phrases already above.
+        "tell me about a difficult",
     )):
         return "leadership"
 
@@ -126,6 +146,18 @@ def _classify_category(question_text: str) -> str:
         "introduce yourself", "walk me through your experience", "your journey",
     )):
         return "career_narrative"
+
+    # Platform-engineering phrasing that would otherwise be swallowed by "build a
+    # platform"/"how would you build" in is_design_phrasing below -- e.g. "how would you
+    # build an internal developer platform" is a platform-governance question (Golden
+    # Path/self-service/Developer Flow shape), not a generic system-design one. Kept to an
+    # unambiguous narrow set so it never steals a genuine architecture question like
+    # "design an AIOps platform" or "design a Kubernetes platform".
+    if any(m in t for m in (
+        "internal developer platform", "developer platform", "self-service infrastructure",
+        "self service infrastructure", "golden path", "golden paths",
+    )):
+        return "platform_engineering"
 
     # Design/build/architect phrasing wins over a narrower domain keyword below --
     # "design a highly available EKS platform" is an architecture question, not a
@@ -191,6 +223,8 @@ def _classify_category(question_text: str) -> str:
         "iac scanning", "secret scanning", "how would you secure", "how do you secure",
         "security posture", "compliance requirements", "prompt injection defense",
         "how would you protect", "vulnerability", "penetration test",
+        # Added 2026-08-26.
+        "zero trust", "protect secrets", "secure a multi-cloud", "secure ci/cd",
     )):
         return "security"
 
@@ -215,10 +249,50 @@ def _classify_category(question_text: str) -> str:
     )):
         return "aws"
 
+    # Infrastructure as Code / Terraform -- state, drift, module design, multi-team/multi-
+    # cloud structuring. Checked BEFORE platform_engineering and cicd_devops: a question that
+    # explicitly names Terraform state/drift/modules is IaC-shaped even if it also mentions
+    # team count (e.g. "structure Terraform for 100 teams" is iac_terraform, not
+    # platform_engineering -- the literal "terraform" keyword is the more specific signal).
+    # "design a Terraform..." questions are already claimed by is_design_phrasing above and
+    # correctly get the general "architecture" shape instead -- this bucket is for the
+    # non-design-phrased IaC questions ("how do you manage state", "how do you prevent
+    # drift", "how do you structure Terraform for N teams").
     if any(m in t for m in (
-        "ci/cd", "cicd", "pipeline failure", "deployment pipeline", "terraform state",
-        "manage terraform", "blue/green", "canary deploy", "rolling deploy",
+        "terraform state", "terraform drift", "terraform module", "terraform modules",
+        "reusable module", "reusable terraform", "structure terraform",
+        "manage terraform", "terraform for aws and gcp", "terraform for multiple",
+        "terraform workspace", "terraform for 100", "terraform for 50",
+        "iac module", "infrastructure as code module", "prevent drift",
+    )):
+        return "iac_terraform"
+
+    # Platform engineering -- governance/standardization-at-scale questions ("prevent 50
+    # teams building 50 pipelines", "balance standardization and autonomy"). Checked before
+    # cicd_devops because "standardize CI/CD" is a platform-governance question in this
+    # framework, not a narrow pipeline-mechanics one -- the distinguishing signal is scale/
+    # governance framing (teams, standardize, self-service), not the underlying tool. The
+    # narrower "internal developer platform"/"golden path" phrasing is already caught earlier
+    # (before is_design_phrasing) so it isn't repeated here.
+    if any(m in t for m in (
+        "50 teams", "100 teams", "500 teams", "many teams", "every team",
+        "prevent every team", "prevent teams", "prevent 50", "prevent 100",
+        "standardize ci/cd", "standardize cicd", "standardize pipelines",
+        "standardize the pipeline", "standardize terraform", "standardize infrastructure",
+        "balance standardization", "standardization and developer autonomy",
+        "standardization and autonomy", "developer autonomy",
+        "without losing standardization", "customization without losing",
+        "scale the platform", "platform team", "provide self-service",
+        "manage standards at enterprise scale", "doing something differently",
+    )):
+        return "platform_engineering"
+
+    if any(m in t for m in (
+        "ci/cd", "cicd", "pipeline failure", "deployment pipeline",
+        "blue/green", "canary deploy", "rolling deploy",
         "artifact registry", "reduce deployment failures", "release pipeline",
+        # Added 2026-08-26: common CI/CD-mechanics phrasing that named no other keyword.
+        "devsecops", "deployment approval", "deployment approvals",
     )):
         return "cicd_devops"
 
@@ -258,6 +332,9 @@ def _classify_category(question_text: str) -> str:
         "one of your production", "started failing",
         "how would you resolve", "how would you fix", "service is", "latency increased",
         "alerts fired", "multiple services", "became unhealthy",
+        # Added 2026-08-26: "latency suddenly increased" didn't match the "latency
+        # increased" substring above once another word split the phrase.
+        "suddenly increased", "costs suddenly increased", "succeeded but",
     )):
         return "scenario_troubleshooting"
 
@@ -273,6 +350,16 @@ def _classify_category(question_text: str) -> str:
         "what is ", "what's ", "what are ", "how does ", "explain what",
     )):
         return "tool_technology"
+
+    # Bare "Why X?" fallback ('Why multi-region?', 'Why Terraform Cloud?', 'Why GitHub
+    # Actions?') -- the longer "why did you choose/build/design/use X" forms are already
+    # claimed by is_design_phrasing above, and "why not X" / "X instead of Y" are already
+    # claimed earlier too, so anything reaching here that still starts with "why" is a
+    # terse "why did you pick this technology" question -- Decision/Context/Alternatives/
+    # Trade-offs/Final Decision fits it better than the generic default shape. Added
+    # 2026-08-26.
+    if t.strip().startswith("why "):
+        return "trade_off"
 
     return "default"
 
@@ -324,24 +411,11 @@ _SHARED_FORMATTING_MECHANICS = (
     "there genuinely are two valid choices, say so and then PICK ONE: 'There are two "
     "reasonable approaches here; for this requirement I'd choose X because...'. Never leave "
     "the interviewer without a recommendation.\n\n"
-    "NO PHILOSOPHICAL FRAMING OR ESSAY OPENERS -- corrected 2026-08-26 after live review: "
-    "a customization-vs-standardization answer opened with 'I'd push back on the "
-    "either/or framing here. The real tension isn't X versus Y -- it's...' and was "
-    "rejected as sounding rehearsed and AI-generated rather than like a real engineer "
-    "answering a question. NEVER reframe or 'push back on' the interviewer's question "
-    "before answering it. State your actual position in the FIRST sentence, no "
-    "throat-clearing. Banned openers and constructions, in any wording that carries the "
-    "same move: 'I'd push back on...', 'the real tension isn't X, it's Y', 'the pattern "
-    "that actually works is...', 'it's worth noting that...', 'fundamentally, this comes "
-    "down to...', 'the question isn't really X, it's Y'. If you notice yourself writing "
-    "one of these, delete it and start with the position instead.\n\n"
-    "CONTENT UNDER A HEADING IS BULLETS, NEVER A PROSE PARAGRAPH. This is the second-"
-    "biggest quality failure after philosophical openers: writing 2+ flowing sentences "
-    "with no bullet marker under a heading, as if writing an essay. Every line under "
-    "every heading starts with '* ' (or nested '   * '). If a thought needs two "
-    "sentences, that is still ONE bullet with two short sentences in it -- it is never an "
-    "unbroken paragraph spanning multiple bullets' worth of content. A wall of prose "
-    "under a heading, however well-written, is wrong regardless of content quality.\n\n"
+    "NO REFRAMING OPENERS -- corrected 2026-08-26: never open by reframing or 'pushing "
+    "back on' the question ('I'd push back on the framing here...', 'the real tension "
+    "isn't X, it's Y...') -- state your actual position in the first sentence instead. "
+    "And the bullet requirement above is literal: content under a heading is bullets, "
+    "never two-plus flowing sentences as an unbulleted paragraph, however well-written.\n\n"
     "WHEN THE TECHNOLOGY IS NOT IN THE PERSONAL TRACK RECORD -- never say 'I haven't used "
     "it' or 'I'm not familiar'. Shift into design voice and answer with full authority: "
     "'From an architecture perspective, I'd approach it this way...', 'If I were designing "
@@ -443,22 +517,37 @@ _CATEGORY_SHAPES: dict[str, str] = {
     ),
     "migration": (
         "QUESTION SHAPE: MIGRATION ('how would you migrate Jenkins to GitHub Actions?', "
-        "'EC2 to EKS?'). Every bullet a complete, speakable sentence. The whole point is "
-        "showing how PRODUCTION RISK IS CONTROLLED, not listing steps. Opening heading is "
-        "exactly '## Current State':\n"
-        "  ## Current State\n"
-        "  ## Target State\n"
-        "  ## Gap Analysis\n"
-        "    * What actually differs, and which gaps are risky versus trivial.\n"
+        "'EC2 to EKS?', 'migrate 500 applications', 'modernize legacy applications'). "
+        "Every bullet a complete, speakable sentence. The whole point is showing how "
+        "PRODUCTION RISK IS CONTROLLED, not listing steps. Opening heading is exactly "
+        "'## Brief Context':\n"
+        "  ## Brief Context\n"
+        "    * Goal -- terse.\n"
+        "    * Current State -- what's being migrated away from and why it matters.\n"
+        "    * Problem -- the real risk this migration has to control for.\n"
+        "    * Approach -- your one-line migration philosophy.\n"
         "  ## Migration Strategy\n"
-        "    * Pilot first, then parallel run, then incremental cutover -- never big-bang. "
-        "Say why explicitly.\n"
-        "  ## Validation And Cutover\n"
-        "    * How you prove the new path is correct before traffic moves.\n"
-        "  ## Rollback\n"
-        "    * The rollback plan, and the point of no return.\n"
-        "  ## Decommission\n"
-        "  ## Key Trade-offs\n"
+        "    * Discovery -- how you find out what actually exists before touching "
+        "anything.\n"
+        "    * Dependency Mapping -- the implicit contracts that blindside people (a "
+        "nightly batch job, a hardcoded IP allowlist).\n"
+        "    * Classification -- which applications/components are low-risk versus "
+        "high-risk, and why that changes the approach.\n"
+        "    * Migration Wave -- how you sequence pilot, then parallel run, then "
+        "incremental cutover -- never big-bang, and say why explicitly.\n"
+        "    * Validation -- how you prove the new path is correct before traffic moves.\n"
+        "    * Cutover -- how traffic actually moves, and the point of no return.\n"
+        "    * Stabilization -- what you watch after cutover before calling it done.\n"
+        "    * Decommissioning -- when and how the old system is actually retired.\n"
+        "    (Only include the steps genuinely relevant to this specific question.)\n"
+        "  ## Migration Flow\n"
+        "    A compact ASCII diagram: Discovery -> Dependency Mapping -> Classification -> "
+        "Migration Wave -> Build Target -> Migrate -> Validate -> Cutover -> Stabilize -> "
+        "Decommission.\n"
+        "  ## Principal Architect Decision\n"
+        "    * Why you chose this migration strategy over the alternatives (big-bang, "
+        "different wave sequencing), and how you're managing the business risk -- not "
+        "just the technical risk.\n"
     ),
     "scalability": (
         "QUESTION SHAPE: SCALABILITY / PERFORMANCE ('how would you scale this to 10x?'). "
@@ -495,8 +584,13 @@ _CATEGORY_SHAPES: dict[str, str] = {
         "    * Automatic or manual, how long it takes, and how it is tested.\n"
         "  ## What Happens When It Fails\n"
         "    * Component failure first, then full region loss. Be concrete.\n"
-        "  ## Trade-offs\n"
-        "    * Active-active vs active-passive, cost vs RTO. Make a recommendation.\n"
+        "  ## Principal Architect Decision\n"
+        "    * Active-active vs active-passive, cost vs RTO -- make a recommendation and "
+        "tie it explicitly to RTO, RPO, business criticality, cost and operational "
+        "complexity, in that order of weight.\n"
+        "    * Never claim 'zero downtime' or 'zero data loss' without stating the "
+        "technical and business assumption underneath it (e.g. 'RPO near-zero assumes "
+        "synchronous cross-AZ replication, which costs the extra write latency').\n"
     ),
     "cost_finops": (
         "QUESTION SHAPE: COST / FINOPS. Never answer 'use cheaper resources'. Every bullet "
@@ -801,9 +895,17 @@ _CATEGORY_SHAPES: dict[str, str] = {
         "    * Decision A vs B -- what you gained, what you gave up, terse\n"
         "  ## Principal Architect Decision  (the closing section -- ALWAYS include this, "
         "it is the answer's actual conclusion, not filler)\n"
-        "    * 4-6 speakable sentences stating the real decisions made and why, e.g. 'Separate "
-        "reasoning from execution', 'Automate the normal path, make escalation first-"
-        "class', 'Make every execution observable and auditable'\n"
+        "    * For each of the 2-3 decisions that actually matter, one bullet in this "
+        "exact shape: what I chose, why I chose it, what alternative I rejected, what "
+        "trade-off I accepted. E.g. 'I separated reasoning from execution because a "
+        "hallucinated action becomes a rejected proposal instead of a live change -- the "
+        "alternative was letting the agent call infrastructure APIs directly, which I "
+        "rejected because a bad inference would execute immediately; the trade-off is an "
+        "extra approval hop on every action.'\n"
+        "  ## Biggest Risk\n"
+        "    * Name the single biggest architectural risk in this design, plainly, and "
+        "how you'd control it -- not a generic 'things could fail' but the specific "
+        "failure mode this design is most exposed to.\n"
         "PROSPECTIVE questions ('design a system for X') -- if you ground an assumption in "
         "a real number from your own experience (account count, team size), ATTRIBUTE it "
         "explicitly ('similar to the ~160 accounts I manage today') rather than stating it "
@@ -818,23 +920,42 @@ _CATEGORY_SHAPES: dict[str, str] = {
         "skip Tool Layer for a question with no tool-calling layer, etc.\n\n"
     ),
     "security": (
-        "QUESTION SHAPE: SECURITY. Speakable full-sentence bullets, naming tool and purpose where tools are "
-        "named. Opening heading is exactly '## Identity':\n"
+        "QUESTION SHAPE: SECURITY ('how would you secure a multi-cloud platform', "
+        "'implement Zero Trust', 'secure CI/CD', 'protect secrets'). Speakable "
+        "full-sentence bullets, naming tool and purpose where tools are named. Opening "
+        "heading is exactly '## Brief Context':\n"
+        "  ## Brief Context\n"
+        "    * Goal -- terse.\n"
+        "    * Threat / Problem -- the actual threat or exposure this question is about, "
+        "not a generic security preamble.\n"
+        "    * Approach -- your one-line security philosophy for this problem.\n"
         "  ## Identity\n"
-        "    * IAM / RBAC / least privilege\n"
+        "    * IAM / RBAC / least privilege / trust boundary -- who or what is allowed to "
+        "act, and under what identity.\n"
         "  ## Network\n"
-        "    * VPC / private subnets / security groups / WAF\n"
+        "    * VPC / private subnets / security groups / WAF -- only if genuinely part of "
+        "this question.\n"
+        "  ## Workload\n"
+        "    * Authentication / authorization / input validation / container and runtime "
+        "hardening.\n"
         "  ## Data\n"
-        "    * Encryption at rest / in transit / KMS / Secrets Manager\n"
-        "  ## Application\n"
-        "    * Authentication / Authorization / Input validation\n"
-        "  ## CI/CD\n"
-        "    * Secret scanning / SAST / SCA / Container scanning / IaC scanning\n"
-        "  ## Runtime\n"
-        "    * Vulnerability management / Monitoring / Audit logs\n"
-        "  ## Compliance\n"
-        "    * Auditability / Data retention / Access reviews\n"
-        "Skip any section that doesn't add real value for this specific question.\n\n"
+        "    * Encryption at rest / in transit / KMS / Secrets Manager.\n"
+        "  ## Pipeline\n"
+        "    * Secret scanning / SAST / SCA / container scanning / IaC scanning.\n"
+        "  ## Monitoring\n"
+        "    * Vulnerability management / audit logs / anomaly detection -- how you'd "
+        "actually find out something went wrong.\n"
+        "  ## Response\n"
+        "    * What happens once something is detected -- containment, revocation, "
+        "rotation, incident process. Only if genuinely part of this question.\n"
+        "  ## Principal Architect Decision\n"
+        "    * Cover, in one bullet each where relevant: trust boundaries, identity "
+        "model, least privilege, secrets handling, encryption, policy enforcement, "
+        "detection, and response -- only the ones this specific question actually turns "
+        "on.\n"
+        "Cover only the relevant layers -- do NOT turn this into a list of every security "
+        "product that exists; skip any layer that doesn't add real value for this "
+        "specific question.\n\n"
     ),
     "kubernetes": (
         "QUESTION SHAPE: KUBERNETES / EKS. Every bullet a complete, speakable sentence. Opening heading is exactly "
@@ -883,21 +1004,29 @@ _CATEGORY_SHAPES: dict[str, str] = {
         "pad the answer.\n\n"
     ),
     "cicd_devops": (
-        "QUESTION SHAPE: CI/CD / DEVOPS. Every bullet a complete, speakable sentence. Opening heading is exactly "
-        "'## Pipeline':\n"
-        "  ## Pipeline\n"
+        "QUESTION SHAPE: CI/CD / DEVOPS ('how would you design enterprise CI/CD', 'how do "
+        "you handle deployment approvals', 'how do you implement DevSecOps', 'how do you "
+        "support 50 teams' when the question is about the pipeline mechanics specifically, "
+        "not platform governance -- see platform_engineering for the governance-framed "
+        "version of team-scale questions). Every bullet a complete, speakable sentence. "
+        "Opening heading is exactly '## Brief Context':\n"
+        "  ## Brief Context\n"
+        "    * Goal -- terse.\n"
+        "    * Problem -- the specific delivery risk this question is really about.\n"
+        "    * Approach -- your one-line pipeline design philosophy.\n"
+        "  ## Pipeline Architecture\n"
         "    A compact ASCII flow: Git -> Build -> Unit Tests -> Security Scan -> Artifact "
-        "-> Deploy -> Validation -> Promotion (adapt stages to what's actually relevant).\n"
-        "  ## Tools\n"
-        "    * Only tools genuinely relevant, 'Tool -- role' shape\n"
-        "  ## Security\n"
-        "    * SAST / SCA / Container scanning / Secret scanning / IaC scanning\n"
-        "  ## Deployment\n"
-        "    * Rolling / Blue-Green / Canary\n"
-        "  ## Validation\n"
-        "    * Health checks / Smoke tests / Metrics / Logs\n"
-        "  ## Rollback\n"
-        "    * Automated rollback / Previous artifact / Previous infra version\n"
+        "-> Deploy Non-Prod -> Validation -> Approval -> Production -> Observability "
+        "(adapt stages to what's actually relevant).\n"
+        "    * Tools -- only tools genuinely relevant, 'Tool -- role' shape.\n"
+        "    * Security -- SAST / SCA / container scanning / secret scanning / IaC "
+        "scanning.\n"
+        "    * Deployment -- rolling / blue-green / canary, and why that one.\n"
+        "    * Approval -- what gates production specifically, and who/what approves.\n"
+        "    * Rollback -- automated rollback, previous artifact, previous infra version.\n"
+        "  ## Principal Architect Decision\n"
+        "    * Explain how you balance standardization, team autonomy, governance and "
+        "delivery speed -- name the actual mechanism, not just that you 'balance' them.\n"
         "Skip any section not relevant to this specific question.\n\n"
     ),
     "sre": (
@@ -969,6 +1098,99 @@ _CATEGORY_SHAPES: dict[str, str] = {
         "  ## Guardrails\n"
         "    * RBAC / Approval / Blast-radius control / Audit / Rollback\n"
         "Skip any section not relevant to this specific question.\n\n"
+    ),
+    # --- Categories added 2026-08-26: Platform Engineering and IaC/Terraform were falling
+    # through to cicd_devops or default, which don't have the module/state/governance or
+    # golden-path/self-service structure this style of question actually needs.
+    "platform_engineering": (
+        "QUESTION SHAPE: PLATFORM ENGINEERING ('how do you prevent 50 teams from creating "
+        "50 pipelines', 'how would you build an internal developer platform', 'how would "
+        "you standardize CI/CD', 'how would you provide self-service infrastructure', 'how "
+        "do you balance standardization and developer autonomy', 'how do you allow "
+        "customization without losing standardization'). Every line under a heading is a "
+        "bullet, never a paragraph. Opening heading is exactly '## Brief Context':\n"
+        "  ## Brief Context\n"
+        "    * Goal -- what the platform needs to enable for application teams, terse.\n"
+        "    * Problem -- the specific sprawl, inconsistency or friction this question is "
+        "really about.\n"
+        "    * Approach -- your one-line platform design philosophy.\n"
+        "  ## Platform Architecture\n"
+        "    * Golden Path -- the paved, supported way to do the common thing, named "
+        "concretely, not just 'a standard way'.\n"
+        "    * Reusable Capabilities -- the shared modules, workflows or templates teams "
+        "consume instead of rebuilding.\n"
+        "    * Developer Interface -- how a team actually requests or uses the platform "
+        "(self-service portal, workflow inputs, service catalog, CLI).\n"
+        "    * Governance -- what is centrally enforced and cannot be bypassed.\n"
+        "    * Security -- what security posture is baked into the golden path by "
+        "default, so teams get it for free.\n"
+        "    * Observability -- what teams get automatically by using the platform "
+        "(logging, tracing, dashboards) without building it themselves.\n"
+        "    * Extension Points -- where and how a team can genuinely customize without "
+        "forking the platform.\n"
+        "    (Skip any bullet that doesn't materially apply to this specific question.)\n"
+        "  ## Developer Flow\n"
+        "    A compact ASCII diagram: Developer -> Platform Interface -> Golden Path -> "
+        "(its real stages, e.g. Build/Test/Security/Artifact/Approval/Deploy) -> "
+        "Production. Adapt the stage list to what's actually relevant.\n"
+        "  ## Principal Architect Decision\n"
+        "    * State plainly what's standardized (non-negotiable) and what remains "
+        "customizable, and who owns which part.\n"
+        "    * Explain how governance is enforced without a human being the bottleneck -- "
+        "policy as code and automated gates, not a manual review queue.\n"
+        "    * Explain the escalation path -- a genuine cross-team need gets absorbed "
+        "into the platform as a supported capability; a one-off need gets a scoped "
+        "extension point; nobody gets to fork the platform.\n"
+        "  ## Biggest Risk\n"
+        "    * Name whichever is the bigger risk for THIS question -- the platform "
+        "becoming too rigid so teams build workarounds, or the platform becoming a "
+        "bottleneck that makes every team wait on the platform team -- and how you'd "
+        "actually detect it (quiet forking, adoption stalling, a growing ticket queue).\n\n"
+    ),
+    "iac_terraform": (
+        "QUESTION SHAPE: INFRASTRUCTURE AS CODE / TERRAFORM ('how do you structure "
+        "Terraform for 100 teams', 'how do you manage Terraform state', 'how do you "
+        "prevent Terraform drift', 'how do you build reusable Terraform modules'). Every "
+        "line under a heading is a bullet, never a paragraph. Opening heading is exactly "
+        "'## Brief Context':\n"
+        "  ## Brief Context\n"
+        "    * Goal -- terse.\n"
+        "    * Problem -- the specific IaC risk this question is really about (state "
+        "conflicts, drift, module sprawl, blast radius, multi-cloud divergence).\n"
+        "    * Approach -- your one-line philosophy.\n"
+        "  ## Terraform Architecture\n"
+        "    * Root / Consumer Layer -- what a team's own repo actually contains -- thin "
+        "composition calling published modules, not raw resource blocks.\n"
+        "    * Reusable Modules -- the shared, versioned modules that encode your "
+        "standards (networking, IAM, compute, database patterns).\n"
+        "    * Provider-Specific Modules -- where AWS and GCP genuinely diverge, and why "
+        "you keep separate provider-specific modules rather than forcing one abstraction "
+        "over both.\n"
+        "    * Shared Standards -- naming, tagging, module input/output contracts, "
+        "testing requirements.\n"
+        "    * State Management -- how state is organized, decided by ownership, "
+        "lifecycle, blast radius and change frequency -- NOT as one giant shared state "
+        "file.\n"
+        "    * Policy / Governance -- Sentinel, OPA or native policy-as-code that blocks "
+        "a plan before it can apply.\n"
+        "    * CI/CD -- how validate, plan and apply are gated in the pipeline.\n"
+        "    (Skip any bullet that doesn't materially apply to this specific question.)\n"
+        "  ## Terraform Flow\n"
+        "    A compact ASCII diagram: Developer -> Git Repository -> Terraform "
+        "Validation -> Security/Policy Checks -> Terraform Plan -> Review/Approval -> "
+        "Terraform Apply -> (branching to AWS and GCP where genuinely multi-cloud).\n"
+        "  ## Principal Architect Decision\n"
+        "    * Abstraction boundaries -- what's common across clouds versus what stays "
+        "provider-specific, and why.\n"
+        "    * Module ownership -- who owns and versions the shared modules, and how a "
+        "breaking change is rolled out.\n"
+        "    * State boundaries and blast radius -- how state is split so one team's "
+        "change cannot break another team's infrastructure.\n"
+        "    * Versioning -- how module consumers pin and deliberately upgrade versions "
+        "rather than silently picking up changes.\n"
+        "Do NOT default to one giant Terraform state file, and do NOT imply AWS and GCP "
+        "primitives are interchangeable -- name the real differences where they matter "
+        "(IAM model, networking primitives, managed-service equivalents).\n\n"
     ),
     "default": (
         "QUESTION SHAPE: DEFAULT (opinion, 'what's your experience with X', 'how do you "
@@ -1042,15 +1264,21 @@ _CATEGORY_WORD_LIMITS: dict[str, int] = {
     "tool_technology": 400,
     "scenario_troubleshooting": 500,
     "architecture": 700,
-    "security": 400,
+    # security and cicd_devops bumped 2026-08-26: added Brief Context opening + Principal
+    # Architect Decision closing to match the 12-type architect framework, same reasoning
+    # as migration below.
+    "security": 450,
     "kubernetes": 400,
     "aws": 400,
-    "cicd_devops": 400,
+    "cicd_devops": 450,
     "sre": 400,
     "observability": 450,
     "aiops": 450,
     "definition": 100,          # 3-sentence structural cap targets 60-90 words; 100 is the backstop
-    "migration": 500,
+    # Bumped 2026-08-26: gained Brief Context opening, expanded 8-step Migration Strategy
+    # vocabulary, a Migration Flow diagram, and a Principal Architect Decision closing --
+    # the old 500-word cap would force cutting one of those sections short.
+    "migration": 550,
     "scalability": 450,
     "ha_dr": 450,
     "cost_finops": 400,
@@ -1058,6 +1286,11 @@ _CATEGORY_WORD_LIMITS: dict[str, int] = {
     "why_not": 350,
     "behavioral": 420,
     "project_ownership": 450,
+    # Added 2026-08-26: Platform Engineering and IaC/Terraform have multi-section shapes
+    # (Brief Context + Architecture/Platform breakdown + Flow diagram + Principal Architect
+    # Decision + closing) comparable in depth to cicd_devops/security, sized accordingly.
+    "platform_engineering": 450,
+    "iac_terraform": 450,
     # Retuned 2026-08-26: user feedback rejected a 200+ word default-category answer as
     # too long/essay-like for a live interview -- target 30-60s spoken (~120-180 words at
     # natural pace) for this category's Direct Answer/Key Points/Example/Judgment shape.
@@ -1535,10 +1768,21 @@ def build_system_prompt(config: LlmConfig | None = None, question_text: str = ""
         "systems via a common client-server interface (an MCP server exposes tools/resources; "
         "an MCP client, e.g. Claude or an agent runtime, connects to it). Do NOT interpret "
         "MCP as 'Multi-Channel Platform', 'Master Control Program', or any other expansion --  "
-        "in this domain context it is always Model Context Protocol. If genuinely unsure "
-        "which meaning an ambiguous acronym has, say so explicitly rather than confidently "
-        "answering the wrong one -- a confidently wrong answer is worse than asking for "
-        "clarification. IMPORTANT (de-identified -- never name the real project): this "
+        "in this domain context it is always Model Context Protocol. Before treating a short "
+        "or unfamiliar acronym as genuinely ambiguous, first check whether it is plausibly a "
+        "speech-to-text mishearing of a term already covered in this persona's own real "
+        "background above -- e.g. 'AIG' spoken in an interview about this candidate's work is "
+        "almost certainly a mangled 'Agentic AI', not the insurance company, because that is "
+        "what the candidate's real experience is actually about. Resolve it to that real term "
+        "silently and answer accordingly, exactly as with any other garbled transcription "
+        "(see GARBLED OR PARTIAL TRANSCRIPTION above) -- do not flag it or ask which one was "
+        "meant. Reserve 'say so explicitly rather than confidently answering the wrong one' "
+        "for a genuinely different situation: an acronym with two REAL, well-established "
+        "meanings in this technical domain (both plausible, neither more likely from context) "
+        "where guessing wrong would produce a substantively different, misleading answer -- "
+        "not a short acronym that simply doesn't match anything and is better explained as "
+        "STT noise around a real term the candidate does have experience with. IMPORTANT "
+        "(de-identified -- never name the real project): this "
         "candidate's real agentic AI system does NOT confirm "
         "using MCP specifically -- tool/function calling there runs through Bedrock's native "
         "agent tool-use via Amazon Q in Connect. If asked whether MCP is used in the actual "
