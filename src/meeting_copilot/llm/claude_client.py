@@ -66,6 +66,37 @@ async def _stream_with_retry(
     raise last_exc
 
 
+async def _stream_with_fallback(
+    make_stream, models: list[str], prompt: str, system: str | None
+) -> AsyncIterator[str]:
+    """Try each model in turn, moving on only if a model produced NO output at all.
+
+    Same safety rule as _stream_with_retry: once real content has reached the candidate,
+    a later failure is raised rather than restarted on another model, since switching
+    mid-answer would duplicate or contradict what is already on screen. Added 2026-08-27 --
+    the app previously ran one model with no alternative, so a sustained provider problem
+    meant a blank overlay for the rest of the interview."""
+    last_exc: Exception | None = None
+    for index, model in enumerate(models):
+        try:
+            produced_output = False
+            async for chunk in _stream_with_retry(make_stream, prompt, system, model=model):
+                produced_output = True
+                yield chunk
+            return
+        except Exception as e:
+            if produced_output:
+                raise
+            last_exc = e
+            if index < len(models) - 1:
+                logger.warning(
+                    f"Model {model!r} failed every attempt ({type(e).__name__}: {e}) -- "
+                    f"falling back to {models[index + 1]!r}"
+                )
+    assert last_exc is not None
+    raise last_exc
+
+
 class _ClaudeBackend(Protocol):
     async def complete(self, prompt: str, system: str | None = None) -> str: ...
     def stream(self, prompt: str, system: str | None = None) -> AsyncIterator[str]: ...
@@ -213,23 +244,30 @@ class ClaudeApiBackend:
         assert last_exc is not None
         raise last_exc
 
-    async def _raw_stream(self, prompt: str, system: str | None) -> AsyncIterator[str]:
-        async with self._client.messages.stream(
-            model=self._cfg.model,
-            max_tokens=self._cfg.max_tokens,
-            system=self._system_blocks(system),
-            messages=[{"role": "user", "content": prompt}],
-        ) as stream:
-            async for text in stream.text_stream:
-                yield text
-            # Prompt size is a real TTFT lever (see orchestrator's per-question latency
-            # log) -- final_message carries the actual usage for this call, only available
-            # once the stream is done, so this can't be captured earlier.
-            final = await stream.get_final_message()
-            self._last_usage = (final.usage.input_tokens, final.usage.output_tokens)
+    async def _raw_stream(
+        self, prompt: str, system: str | None, model: str | None = None
+    ) -> AsyncIterator[str]:
+        # asyncio.timeout wraps the WHOLE generation, not just connection setup, so a
+        # provider that accepts the request and then stalls mid-stream is bounded too.
+        async with asyncio.timeout(self._cfg.stream_timeout_seconds):
+            async with self._client.messages.stream(
+                model=model or self._cfg.model,
+                max_tokens=self._cfg.max_tokens,
+                system=self._system_blocks(system),
+                messages=[{"role": "user", "content": prompt}],
+            ) as stream:
+                async for text in stream.text_stream:
+                    yield text
+                # Prompt size is a real TTFT lever (see orchestrator's per-question latency
+                # log) -- final_message carries the actual usage for this call, only available
+                # once the stream is done, so this can't be captured earlier.
+                final = await stream.get_final_message()
+                self._last_usage = (final.usage.input_tokens, final.usage.output_tokens)
 
     def stream(self, prompt: str, system: str | None = None) -> AsyncIterator[str]:
-        return _stream_with_retry(self._raw_stream, prompt, system)
+        return _stream_with_fallback(
+            self._raw_stream, [self._cfg.model, *self._cfg.fallback_models], prompt, system
+        )
 
 
 class OpenAiApiBackend:

@@ -218,6 +218,16 @@ class LlmConfig(BaseModel):
     cli_timeout_seconds: int = 180
     model: str = "claude-haiku-4-5-20251001"  # fastest model; answer quality is driven
     # mainly by the interview-format system prompt (see llm/prompt_templates.py)
+    # Tried in order when the primary model fails every retry. Audited 2026-08-27: a single
+    # model with no fallback was a single point of failure for the whole app -- a sustained
+    # provider issue left the overlay blank mid-interview with nothing to show. Empty list
+    # disables fallback.
+    fallback_models: list[str] = ["claude-sonnet-4-5-20250929"]
+    # Hard ceiling on ONE streaming generation. The API path previously had no timeout at
+    # all (only the CLI backend did), so a hung connection could stall a question forever.
+    # Generous relative to the ~1.05s P50 / 1.5s max time-to-first-token measured in a real
+    # session -- this is a stall guard, not a latency control.
+    stream_timeout_seconds: float = 45.0
     openai_model: str = "gpt-4o"  # only used when backend=openai
     persona: str = (
         "You are a candidate with 14+ years of technology architecture experience "

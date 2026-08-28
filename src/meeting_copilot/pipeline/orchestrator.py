@@ -201,6 +201,36 @@ _ANAPHORA_MARKERS = (
     "for the same", "the same time", "at the same time",
 )
 
+# CORRECTIONS -- the interviewer restating what they meant, which must REPLACE the previous
+# interpretation rather than be merged onto it. Identified as a real defect 2026-08-27:
+# "Would you use ECS?" followed by "Actually, I mean Kubernetes" hit the answer-revision
+# path and produced one answer covering BOTH, which is a wrong answer on screen rather than
+# merely a slow one. Distinct from _NEW_QUESTION_OPENERS (which start an unrelated topic)
+# and from anaphora (which extend the same question) -- a correction keeps the previous
+# question's SUBJECT but replaces one of its terms.
+_CORRECTION_MARKERS = (
+    "actually, i mean", "actually i mean", "actually, i meant", "actually i meant",
+    "sorry, i mean", "sorry i mean", "sorry, i meant", "sorry i meant",
+    "i mean ", "i meant ", "what i mean is", "what i meant was",
+    "let me rephrase", "let me restate", "rephrase that", "to clarify",
+    "no, i was asking", "no i was asking", "no, i'm asking", "no i'm asking",
+    "that's not what i", "thats not what i", "i should say", "correction",
+    "rather than", " i mean,",
+)
+
+
+def _is_correction(text: str) -> bool:
+    """True when this turn restates/corrects the previous question rather than extending it.
+
+    Deliberately checked on the FIRST part of the utterance only: a correction marker is an
+    opener ("Actually, I mean Kubernetes"), whereas the same words appearing deep in a long
+    sentence are usually ordinary speech ("...the trade-off I mean here is cost"), and
+    treating those as corrections would wrongly discard a real question."""
+    lowered = text.lower().strip()
+    head = lowered[:60]
+    return any(marker in head for marker in _CORRECTION_MARKERS)
+
+
 # An interviewer statement that is NOT a question and must never trigger an answer.
 _FRAGMENT_STARTERS = (
     "and", "or", "but", "also", "plus", "with", "for", "from", "into", "across",
@@ -505,6 +535,10 @@ class MeetingPipeline:
         # count against the cap). Reset to 1 on every genuinely new turn, incremented on
         # every successful revision merge -- see _MAX_REVISION_QUESTIONS.
         self._revision_count = 0
+        # Set when the current pending question is a CORRECTION of the previous one, so the
+        # answer generator is told to replace the earlier interpretation rather than cover
+        # both. Consumed (and cleared) by _process_transcript.
+        self._pending_is_correction = False
         # Rolling conversation memory: the last few (question, answer) pairs. Without this,
         # every question is answered in isolation -- which is why bare follow-ups ("Why?",
         # "What about 100k events/sec?", "Give me an example") were previously answered as
@@ -593,7 +627,14 @@ class MeetingPipeline:
                 and (transcript.start_time - self._last_answered.end_time)
                 < _ANSWER_REVISION_WINDOW_SECONDS
                 and _is_question_enhancement(transcript.text)  # no explicit pivot phrase
-                and not _is_topic_change(transcript.text, self._last_answered.text)
+                # A correction ALWAYS belongs in this branch: by definition it restates the
+                # question just asked, so it must replace that answer rather than start a
+                # new turn -- it bypasses the topic-change check, which could otherwise
+                # split it off as unrelated.
+                and (
+                    _is_correction(transcript.text)
+                    or not _is_topic_change(transcript.text, self._last_answered.text)
+                )
                 and self._revision_count < _MAX_REVISION_QUESTIONS
             ):
                 # ANSWER REVISION: we already answered, and within the revision window the
@@ -612,6 +653,13 @@ class MeetingPipeline:
                 # (numbered "Question 1:/Question 2:") from a same-question addition (plain
                 # concatenation) -- see its docstring.
                 merged_text = self._format_pending_addition(self._last_answered.text, transcript)
+                # Carried into _process_transcript, which turns it into an explicit
+                # "the second statement REPLACES the first" instruction. Tracked as state
+                # rather than re-detected from merged_text, because by then the correction
+                # marker sits mid-string where a head-only check can't see it.
+                self._pending_is_correction = _is_correction(transcript.text)
+                if self._pending_is_correction:
+                    logger.info(f"CORRECTION detected -- replacing interpretation: {transcript.text!r}")
                 # Guard against re-answering the same thing forever. Whisper re-emits
                 # near-identical text for echo/noise tails, and without this the merged
                 # question barely changes yet still triggers a full cancel+regenerate --
@@ -977,14 +1025,19 @@ class MeetingPipeline:
             else:
                 context = RetrievedContext(question=question, chunks=[])
 
-            chunk_texts = [c.text for c in context.chunks]
-            # Follow-ups depend on prior context, so they must never serve a cached answer
-            # keyed only on their own (short, ambiguous) text -- "Why?" would collide across
-            # completely unrelated discussions.
-            cached_text = (
-                None
-                if conversation_context
-                else await self._cache.get_llm_response(question.transcript.text, chunk_texts)
+            # Follow-ups depend on prior context, so they must never serve an answer cached
+            # under their own (short, ambiguous) text alone -- "Why?" would collide across
+            # completely unrelated discussions. That is why this used to skip the cache
+            # entirely whenever conversation context was present. Corrected 2026-08-27:
+            # context now attaches by DEFAULT on nearly every turn, so "skip when context
+            # exists" had silently disabled the cache almost entirely -- it was never
+            # written, therefore never read. Fix is to make the context part of the KEY
+            # rather than a reason to bypass the cache: identical question + identical
+            # conversation state is genuinely the same request and is safe to reuse, while
+            # "Why?" in two different discussions now hashes to two different keys.
+            cache_key_parts = [*(c.text for c in context.chunks), conversation_context]
+            cached_text = await self._cache.get_llm_response(
+                question.transcript.text, cache_key_parts
             )
             # Time-based compound-turn grouping (2026-08-25): _format_pending_addition
             # marks a compound turn with literal "Question 1:"/"Question 2:" numbering.
@@ -1008,6 +1061,24 @@ class MeetingPipeline:
                     "an artificial connection between unrelated questions just because they "
                     "arrived in the same turn.\n"
                 )
+            # CORRECTION -- the interviewer restated what they meant, so the earlier reading
+            # is void. Without this the model sees "Would you use ECS? Actually, I mean
+            # Kubernetes" as a compound turn and answers BOTH, which is a wrong answer on
+            # screen rather than merely a slow one (identified 2026-08-27).
+            correction_instruction = ""
+            if self._pending_is_correction:
+                correction_instruction = (
+                    "\n\nCORRECTION -- the interviewer CORRECTED their own question partway "
+                    "through this turn. The later statement REPLACES the earlier one; the "
+                    "earlier wording is void. Answer ONLY the corrected question. Do not "
+                    "answer the original, do not compare the two, and do not mention that a "
+                    "correction happened -- just answer what they actually meant. Where the "
+                    "correction only swaps one term (e.g. the platform, service or "
+                    "technology), keep the rest of the original question's intent intact and "
+                    "substitute that term.\n"
+                )
+            self._pending_is_correction = False
+
             # "classification" (_classify_category inside build_system_prompt) is cheap
             # deterministic string matching, not an LLM call -- folded into this one
             # "context_prep" stage rather than split out, since separately timing a
@@ -1017,6 +1088,7 @@ class MeetingPipeline:
                     build_system_prompt(question_text=question.transcript.text)
                     + conversation_context
                     + compound_instruction
+                    + correction_instruction
                 )
             q_prefix = f"**Q:** {question.transcript.text}\n\n---\n\n"
             llm_ttft_seconds = 0.0
@@ -1060,10 +1132,9 @@ class MeetingPipeline:
                             return
                         if self._on_partial_answer:
                             await self._on_partial_answer(q_prefix + raw_text)
-                if not conversation_context:
-                    await self._cache.set_llm_response(
-                        question.transcript.text, chunk_texts, raw_text
-                    )
+                await self._cache.set_llm_response(
+                    question.transcript.text, cache_key_parts, raw_text
+                )
 
             # DETERMINISTIC BACKSTOP: prompt instructions alone proved unreliable at
             # stopping the model from asking the interviewer to clarify -- it just
