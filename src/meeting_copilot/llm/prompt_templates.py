@@ -175,7 +175,26 @@ def _classify_category(question_text: str) -> str:
         "explain the architecture", "overview of the architecture", "overview of your architecture",
         "component level of architecture", "component-level architecture",
     ))
-    if is_design_phrasing:
+    # ...EXCEPT when the thing being designed is itself delivery tooling. Measured
+    # 2026-09-01: "how would you design reusable GitHub Actions workflows?" matched
+    # "how would you design" and returned the generic architecture shape, so the
+    # purpose-built cicd_devops shape (pipeline flow, security gates, artifacts,
+    # promotion, pipeline secrets, rollback) was unreachable for the single most likely
+    # question of a CI/CD-focused interview. "Design" describes the phrasing here, not
+    # the subject -- when the subject is a pipeline, a workflow or a Terraform module,
+    # the specific shape below is strictly better than the general one.
+    _DELIVERY_TOOLING_SUBJECT = (
+        "github action", "github actions", "reusable workflow", "reusable workflows",
+        "composite action", "shared workflow", "workflow template", "gitlab ci", "jenkins",
+        "ci/cd", "cicd", "pipeline", "pipelines", "deployment template",
+        # Bare "terraform"/"opentofu", not just "terraform module": measured that
+        # "how would you design Terraform for AWS and GCP?" -- a headline JD question --
+        # still fell to architecture because it names no module/state noun. If the question
+        # names the IaC tool at all, the iac_terraform shape (state, modules, drift, policy,
+        # multi-cloud boundaries) answers it better than the generic architecture one.
+        "terraform", "opentofu", "iac module",
+    )
+    if is_design_phrasing and not any(m in t for m in _DELIVERY_TOOLING_SUBJECT):
         return "architecture"
 
     # Strong incident/triage framing wins over a bare domain-keyword match below --
@@ -293,6 +312,20 @@ def _classify_category(question_text: str) -> str:
         "artifact registry", "reduce deployment failures", "release pipeline",
         # Added 2026-08-26: common CI/CD-mechanics phrasing that named no other keyword.
         "devsecops", "deployment approval", "deployment approvals",
+        # Added 2026-09-01 for the Carrier DevOps Platform Engineer JD, after measuring that
+        # its headline topics were routing away from this shape entirely:
+        #   "design reusable GitHub Actions workflows"      -> architecture (wrong shape)
+        #   "handle secrets and artifacts across clouds"    -> default (180-word cap!)
+        # Both are core JD responsibilities, so both were getting a generic answer while the
+        # purpose-built CI/CD shape sat unused. Named tools first, then the delivery concerns
+        # that only ever appear in a pipeline question.
+        "github action", "github actions", "reusable workflow", "reusable workflows",
+        "composite action", "shared workflow", "workflow template", "gitlab ci", "jenkins",
+        "build artifact", "build artifacts", "artifact management", "artifact promotion",
+        "promote the artifact", "environment promotion", "deployment template",
+        "build and deployment", "build failure", "build failures", "sast", "sca ",
+        "container scanning", "image scanning", "secret scanning", "sbom",
+        "supply chain security", "pipeline secrets", "secrets and artifacts",
     )):
         return "cicd_devops"
 
@@ -307,6 +340,13 @@ def _classify_category(question_text: str) -> str:
         "otel", "alert noise", "alert correlation", "log aggregation", "distributed trac",
         "which telemetry", "observability stack", "monitoring stack",
         "logging stack", "tracing stack", "observability strategy",
+        # Added 2026-09-01: "how would you establish observability standards across services?"
+        # -- a headline JD responsibility -- fell through to default and its 180-word cap,
+        # because every existing key was a noun phrase this phrasing never uses.
+        "observability standard", "observability standards", "logging standard",
+        "logging standards", "monitoring standard", "monitoring standards",
+        "logs, metrics", "logs metrics and traces", "metrics and traces",
+        "structured logging", "instrument our services", "instrumentation standard",
     )):
         return "observability"
 
@@ -1322,28 +1362,102 @@ _CATEGORY_SHAPES: dict[str, str] = {
         "50 pipelines', 'how would you build an internal developer platform', 'how would "
         "you standardize CI/CD', 'how would you provide self-service infrastructure', 'how "
         "do you balance standardization and developer autonomy', 'how do you allow "
-        "customization without losing standardization'). Every line under a heading is a "
-        "bullet, never a paragraph. Opening heading is exactly '## Brief Context':\n"
+        "customization without losing standardization').\n"
+        "GIVE EACH CONCERN ITS OWN SECTION, ROUGHLY TWO BULLETS EACH. Corrected 2026-09-01: "
+        "these sat as sub-bullets under one 'Platform Architecture' heading, so the parts an "
+        "interviewer for a platform role actually digs into -- how a team onboards, how "
+        "adoption is earned rather than mandated, how the platform is versioned and rolled "
+        "out, how success is measured -- were easy to skip. Every line under a heading is a "
+        "bullet, never a paragraph, and each names the real mechanism. Drop a section that "
+        "genuinely does not apply.\n"
         "  ## Brief Context\n"
-        "    * Goal -- what the platform needs to enable for application teams, terse.\n"
-        "    * Problem -- the specific sprawl, inconsistency or friction this question is "
-        "really about.\n"
-        "    * Approach -- your one-line platform design philosophy.\n"
+        "    * The specific sprawl, inconsistency or friction this question is really about.\n"
+        "    * Your platform philosophy in a line -- the standard is the easiest path, not "
+        "the mandated one.\n"
+        "  ## Golden Path\n"
+        "    * The paved, supported way to do the common thing, named concretely -- not "
+        "'a standard way'.\n"
+        "    * What a team gets for free by staying on it, so choosing it is the rational "
+        "choice rather than a compliance obligation.\n"
         "  ## Platform Architecture\n"
-        "    * Golden Path -- the paved, supported way to do the common thing, named "
-        "concretely, not just 'a standard way'.\n"
-        "    * Reusable Capabilities -- the shared modules, workflows or templates teams "
-        "consume instead of rebuilding.\n"
-        "    * Developer Interface -- how a team actually requests or uses the platform "
-        "(self-service portal, workflow inputs, service catalog, CLI).\n"
-        "    * Governance -- what is centrally enforced and cannot be bypassed.\n"
-        "    * Security -- what security posture is baked into the golden path by "
-        "default, so teams get it for free.\n"
-        "    * Observability -- what teams get automatically by using the platform "
-        "(logging, tracing, dashboards) without building it themselves.\n"
-        "    * Extension Points -- where and how a team can genuinely customize without "
+        "    * The layers: platform repo owning shared workflows and modules, application "
+        "repos consuming them by version, and the cloud accounts they deploy into.\n"
+        "    * Who owns which layer, and the interface between them.\n"
+        "  ## Reusable CI/CD Workflows\n"
+        "    * Organization-level reusable GitHub Actions workflows for build, test, scan, "
+        "image publish and deploy; app repos consume them via `workflow_call` and pass only "
+        "application-specific inputs -- runtime, environment, deployment target.\n"
+        "    * Referenced by version tag (`uses: org/platform-workflows/deploy@v2`) so fixes "
+        "propagate without anyone forking, and composite actions for the shared steps.\n"
+        "  ## Terraform Modules\n"
+        "    * Versioned modules in a private registry for networking, cluster, database and "
+        "IAM; app teams write thin composition, never raw resource blocks.\n"
+        "    * Module input contracts encode the standard -- tagging, naming, encryption and "
+        "least-privilege defaults are not optional inputs.\n"
+        "  ## Deployment Templates\n"
+        "    * Standard Helm charts or Kustomize bases carrying probes, resource requests, "
+        "PodDisruptionBudgets and topology spread so teams inherit them.\n"
+        "    * One artifact promoted across environments; only values files differ.\n"
+        "  ## Developer Interface and Self-Service\n"
+        "    * A repository template that provisions the standard workflow, Terraform module "
+        "references, environment config and observability wiring -- no ticket to the platform "
+        "team to create an application.\n"
+        "    * Day one experience: from empty repo to running service, and how long it takes.\n"
+        "  ## Extension Points\n"
+        "    * Where a team can genuinely customize -- a named hook or input -- without "
         "forking the platform.\n"
-        "    (Skip any bullet that doesn't materially apply to this specific question.)\n"
+        "    * The escalation path: a genuine cross-team need is absorbed as a supported "
+        "capability, a one-off gets a scoped extension, nobody forks.\n"
+        "  ## Governance\n"
+        "    * What is centrally enforced and cannot be bypassed, enforced by policy as code "
+        "and automated gates rather than a manual review queue.\n"
+        "    * How an exception is granted, recorded and time-bounded.\n"
+        "  ## Security and DevSecOps Guardrails\n"
+        "    * Mandatory checks live INSIDE the reusable workflow -- SAST, dependency/SCA, "
+        "container image scanning, IaC validation, secret scanning -- so an individual repo "
+        "cannot bypass them by editing its own pipeline.\n"
+        "    * Critical findings break the build; lower severities warn. Exceptions are "
+        "granted through governance, recorded and time-bounded.\n"
+        "  ## Secrets and Configuration\n"
+        "    * Secrets in Secrets Manager or Secret Manager, surfaced to workloads through "
+        "the Secrets Store CSI driver; config in ConfigMaps -- never baked into an image.\n"
+        "    * Pipelines authenticate to the cloud with OIDC short-lived credentials scoped "
+        "per environment, not long-lived static keys in repo secrets.\n"
+        "  ## Artifact Management\n"
+        "    * Immutable, versioned images in ECR and Artifact Registry, built once and "
+        "promoted -- never rebuilt per environment.\n"
+        "    * Signed with provenance, retention policy, and traceable to the commit that "
+        "produced them.\n"
+        "  ## Multi-Cloud Standardization\n"
+        "    * Standardize the layer developers touch -- the workflow interface, naming and "
+        "tagging, environment model, IAM patterns, observability conventions.\n"
+        "    * Keep provider-specific Terraform modules underneath rather than one leaky "
+        "abstraction hiding AWS and GCP: EKS and GKE, ECR and Artifact Registry, CloudWatch "
+        "and Cloud Monitoring, IRSA and Workload Identity.\n"
+        "  ## Observability by Default\n"
+        "    * What a team gets automatically -- structured logs, the standard metric set, "
+        "traces, a dashboard and baseline alerts -- without building it.\n"
+        "    * The conventions that make it work across services: correlation and trace IDs, "
+        "consistent service and environment labels.\n"
+        "  ## Platform Reliability\n"
+        "    * The platform is production for its consumers -- a broken shared workflow "
+        "blocks every team, so it gets tested, versioned and rolled out like a product.\n"
+        "    * Changes land behind a new version tag and are piloted before the tag moves; "
+        "there is a documented way to pin back if a release misbehaves.\n"
+        "  ## Versioning and Rollout\n"
+        "    * How the platform itself is versioned, and how a breaking change reaches "
+        "consumers without breaking them.\n"
+        "    * How you deprecate an old version and migrate the teams still on it.\n"
+        "  ## Adoption\n"
+        "    * How adoption is earned -- pilot teams, migration help, making the paved road "
+        "faster than the alternative -- rather than mandated.\n"
+        "    * How you handle the team that resists, and when that resistance is a real "
+        "signal about the platform.\n"
+        "  ## Measuring Success\n"
+        "    * The metrics that show it is working -- adoption rate, time from repo to "
+        "production, lead time, change failure rate, how much duplicated pipeline code "
+        "disappeared.\n"
+        "    * Treat the platform as a product with internal customers, not a mandate.\n"
         "  ## Developer Flow\n"
         "    A compact ASCII diagram: Developer -> Platform Interface -> Golden Path -> "
         "(its real stages, e.g. Build/Test/Security/Artifact/Approval/Deploy) -> "
@@ -1534,7 +1648,7 @@ _CATEGORY_WORD_LIMITS: dict[str, int] = {
     # Added 2026-08-26: Platform Engineering and IaC/Terraform have multi-section shapes
     # (Brief Context + Architecture/Platform breakdown + Flow diagram + Principal Architect
     # Decision + closing) comparable in depth to cicd_devops/security, sized accordingly.
-    "platform_engineering": 450,
+    "platform_engineering": 750,
     "iac_terraform": 650,
     # Retuned 2026-08-26: user feedback rejected a 200+ word default-category answer as
     # too long/essay-like for a live interview -- target 30-60s spoken (~120-180 words at
