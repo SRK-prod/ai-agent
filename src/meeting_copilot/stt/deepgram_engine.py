@@ -54,18 +54,48 @@ def _to_wav_bytes(samples: np.ndarray, sample_rate: int) -> bytes:
     return buf.getvalue()
 
 
+def _encode(samples: np.ndarray, sample_rate: int) -> tuple[bytes, str]:
+    """Encode an utterance for upload, returning (body, content_type).
+
+    FLAC by preference: it is LOSSLESS, so transcription accuracy is identical to WAV, but
+    roughly half the bytes. That matters because the upload shares the link with the video
+    call itself -- measured 2026-09-01, a 48s WAV (1.5MB) hit the write timeout and the
+    utterance was lost, while smaller bodies went through in well under a second. Halving
+    the payload halves the exposure to that.
+
+    Falls back to WAV if libsndfile has no FLAC support in this build, since a slightly
+    larger request is obviously better than no transcription.
+    """
+    try:
+        import soundfile as sf
+
+        buf = io.BytesIO()
+        sf.write(buf, np.clip(samples, -1.0, 1.0), sample_rate, format="FLAC", subtype="PCM_16")
+        return buf.getvalue(), "audio/flac"
+    except Exception:
+        logger.debug("FLAC encode unavailable, sending WAV", exc_info=True)
+        return _to_wav_bytes(samples, sample_rate), "audio/wav"
+
+
 class DeepgramEngine:
     def __init__(self, config: SttConfig | None = None):
         self._cfg = config or get_config().stt
         self._api_key = get_config().secrets.require_deepgram_key()
-        # One client, reused: a fresh TLS handshake per utterance would add ~200-300ms to
-        # every question, which is a meaningful slice of the budget this engine exists to fix.
+        # One client, reused, with the idle connection held open for the whole interview.
+        # Measured from this machine 2026-09-01 (78KB body, a 2.5s utterance):
+        #     cold, including DNS + TLS handshake   1044 ms
+        #     warm, connection reused                247 ms
+        # httpx's default keepalive_expiry is only 5s, and interview questions are minutes
+        # apart -- so with the default EVERY question would pay the cold path and this engine
+        # would hand back most of the latency it exists to save. Holding one idle connection
+        # open costs nothing and keeps every question on the 247ms path.
         self._client = httpx.Client(
             timeout=httpx.Timeout(self._cfg.cloud_timeout_seconds),
-            headers={
-                "Authorization": f"Token {self._api_key}",
-                "Content-Type": "audio/wav",
-            },
+            limits=httpx.Limits(
+                max_keepalive_connections=1,
+                keepalive_expiry=self._cfg.cloud_keepalive_seconds,
+            ),
+            headers={"Authorization": f"Token {self._api_key}"},
         )
         logger.info(f"Deepgram STT engine ready (model={self._cfg.deepgram_model})")
 
@@ -94,16 +124,38 @@ class DeepgramEngine:
                 f"DeepgramEngine expects 16kHz audio, got {sample_rate}Hz -- "
                 "resample before calling transcribe_samples."
             )
-        try:
-            resp = self._client.post(
-                _ENDPOINT, params=self._params(), content=_to_wav_bytes(samples, sample_rate)
-            )
-            resp.raise_for_status()
-            payload = resp.json()
-        except Exception:
+        body, content_type = _encode(samples, sample_rate)
+
+        # One retry. The observed failure mode is a transient write timeout when the upload
+        # competes with the video call for bandwidth, and a retry on a fresh connection
+        # costs far less than silently dropping a real interview question. Bounded at two
+        # attempts so a genuine outage still fails fast rather than eating the answer window.
+        last_error: Exception | None = None
+        for attempt in (1, 2):
+            try:
+                resp = self._client.post(
+                    _ENDPOINT,
+                    params=self._params(),
+                    content=body,
+                    headers={"Content-Type": content_type},
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+                break
+            except Exception as exc:  # noqa: BLE001 -- see below; must never reach the pipeline
+                last_error = exc
+                if attempt == 1:
+                    logger.warning(
+                        f"Deepgram request failed ({type(exc).__name__}), retrying once "
+                        f"[{len(body) / 1024:.0f}KB {content_type}]"
+                    )
+        else:
             # Never raise into the pipeline: a transcription failure must cost one question,
             # not the whole session. SttStage treats "" as "nothing was said" and moves on.
-            logger.exception("Deepgram request failed -- dropping this utterance")
+            logger.error(
+                f"Deepgram failed twice, dropping this utterance: {type(last_error).__name__}: "
+                f"{last_error}"
+            )
             return ""
 
         try:

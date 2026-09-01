@@ -72,12 +72,13 @@ class SileroVAD:
                     # took 11.1s to decode, so the answer appeared 14s after the question --
                     # while a normal 2.4s segment answered in 5.1s.
                     #
-                    # Safe to cut here because decode cost on this CPU is LINEAR in duration
-                    # (measured 0.435s per second of audio, ~zero fixed per-call overhead),
-                    # so splitting an utterance costs nothing extra in total. That is the
-                    # opposite of the Apple-GPU/large-v3-turbo case, where a ~2.5s fixed
-                    # encoder floor per call meant chunking multiplied cost -- do not carry
-                    # this setting back to a machine with that profile without re-measuring.
+                    # CUT AT THE WINDOW BOUNDARY, NOT SOONER. Whisper decodes in fixed
+                    # 30-second windows, so cost is flat inside a window and steps sharply
+                    # at the boundary -- measured (base, CPU): 12s->2.98s, 24s->3.56s,
+                    # 28s->4.54s, then 32s->7.66s once a second window is needed. Cutting
+                    # EARLIER than the boundary therefore makes things worse, not better: it
+                    # turns one window's work into two. max_speech_ms is sized just under 30s
+                    # for that reason, and lowering it to "get answers sooner" is a trap.
                     #
                     # A cut mid-question is handled downstream: the orchestrator's fragment
                     # merge (_FRAGMENT_MERGE_GAP_SECONDS) and answer-revision window fold the

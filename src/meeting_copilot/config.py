@@ -120,6 +120,10 @@ class SttConfig(BaseModel):
     # A cloud call must fail fast: the pipeline can survive losing one utterance, but not a
     # request that hangs past the point where the answer would still be useful.
     cloud_timeout_seconds: float = 8.0
+    # Hold the idle HTTPS connection open across a whole interview. Questions are minutes
+    # apart and a cold connection costs ~1s of TLS setup vs ~250ms warm (measured) -- the
+    # library default of 5s would put every single question on the cold path.
+    cloud_keepalive_seconds: float = 3600.0
     model_size: str = "distil-large-v3"
     device: Literal["auto", "cpu", "cuda", "mps"] = "auto"
     compute_type: str = "int8"

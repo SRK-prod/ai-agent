@@ -7,8 +7,15 @@ happens here, so the Qt event loop never blocks.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QRectF, Qt
-from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPainterPath, QPaintEvent
+from PySide6.QtCore import QPoint, QRectF, Qt
+from PySide6.QtGui import (
+    QColor,
+    QGuiApplication,
+    QMouseEvent,
+    QPainter,
+    QPainterPath,
+    QPaintEvent,
+)
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QScrollArea, QVBoxLayout, QWidget
 
 from meeting_copilot.config import OverlayConfig, get_config
@@ -42,6 +49,8 @@ class OverlayWindow(QWidget):
         self._cfg = config or get_config().overlay
         self._pinned = self._cfg.always_on_top
         self._expanded = False
+        # Cursor-to-window offset held while dragging; None when not dragging.
+        self._drag_offset: QPoint | None = None
 
         self._apply_window_flags()
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -118,6 +127,49 @@ class OverlayWindow(QWidget):
         screen = QGuiApplication.primaryScreen().availableGeometry()
         margin = 24
         self.move(screen.width() - self.width() - margin, margin)
+
+    # --- drag to reposition -------------------------------------------------
+    # The window is deliberately frameless (no title bar to grab) and a Qt "Tool" window
+    # (no taskbar button, so no minimize control either). That is right for an overlay --
+    # it must not look like an app window during a screen share -- but it left the window
+    # physically stuck wherever it opened, which is a problem when it covers the thing the
+    # candidate needs to see. Reported live 2026-09-01: "not able to move/minimize the
+    # overlay". Dragging the panel body is the standard substitute for a title bar.
+    # Ctrl+Alt+H already hides it; that is the "minimize".
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            # Offset between the cursor and the window origin, so the window keeps its
+            # grab point under the cursor instead of jumping its top-left corner there.
+            self._drag_offset = (
+                event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            )
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._drag_offset is not None:
+            self._drag_offset = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        """Double-click snaps back to the default corner -- a way out of having dragged the
+        panel somewhere unhelpful (or off a screen that has since been disconnected)."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._move_to_top_right_corner()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def show_partial_answer(self, text_so_far: str) -> None:
         """Called as the answer streams in, before the final formatted/confidence-gated

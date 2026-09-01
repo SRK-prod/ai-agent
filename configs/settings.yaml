@@ -23,20 +23,24 @@ vad:
                                 # to stitch back together downstream), at the cost of ~300ms
                                 # extra latency before an answer starts. Worth it: a correctly
                                 # captured whole question beats a fast partial one.
-  max_speech_ms: 12000          # force-close a segment after 12s of continuous speech even if
-                                # the speaker hasn't paused. Added 2026-09-01: silence was the
-                                # ONLY thing that closed a segment, so an interviewer talking
-                                # without a break produced one huge segment and nothing reached
-                                # STT until they stopped -- measured live, a 28.9s segment took
-                                # 11.1s to decode and the answer landed 14s after the question,
-                                # vs 5.1s for a normal 2.4s segment. Safe here because decode
-                                # cost is LINEAR on this CPU (0.435s per second of audio, no
-                                # meaningful per-call floor), so splitting costs nothing extra;
-                                # the orchestrator's fragment-merge + answer-revision window
+  max_speech_ms: 28000          # force-close a segment after 28s of continuous speech even if
+                                # the speaker hasn't paused. Silence is otherwise the ONLY thing
+                                # that closes a segment, so an interviewer talking without a
+                                # break produces one huge segment and nothing reaches STT until
+                                # they finally stop.
+                                # WHY 28000 AND NOT LOWER: Whisper decodes in fixed 30-SECOND
+                                # WINDOWS, so cost is flat within a window and steps at the
+                                # boundary. Measured here (model=base, idle CPU, 2026-09-01):
+                                #   12s -> 2.98s | 24s -> 3.56s | 28s -> 4.54s   (1 window)
+                                #   32s -> 7.66s | 45s -> 8.11s | 60s -> 8.51s   (2 windows)
+                                # An earlier value of 12000 was set on a wrong assumption that
+                                # cost was linear in length: it split a 24s question into two
+                                # calls (~6s) where one call costs 3.56s -- nearly doubling the
+                                # work. 28s keeps every utterance inside a single window while
+                                # still capping a runaway monologue. Do not lower this to
+                                # "get answers sooner"; it makes them later.
+                                # The orchestrator's fragment-merge + answer-revision window
                                 # stitch a mid-question cut back together. 0 disables.
-                                # NOTE: re-measure before enabling on Apple-GPU/large-v3-turbo,
-                                # where a ~2.5s fixed encoder cost per call makes cutting a net
-                                # loss (that is why the Mac never had this).
 
 speaker:
   enabled: false        # WINDOWS/VB-Cable: OFF. Diarization exists to drop the candidate's
@@ -57,9 +61,22 @@ speaker:
   enrollment_db_path: data/speaker_enrollment.sqlite3
 
 stt:
-  backend: faster-whisper   # faster-whisper = local CPU | mlx-whisper = Apple GPU | deepgram = cloud
+  backend: deepgram      # faster-whisper = local CPU | mlx-whisper = Apple GPU | deepgram = cloud
                          #
-                         # RECOMMENDED ON THIS MACHINE: deepgram. Local STT is the entire
+                         # MEASURED ON THIS MACHINE against the real recorded client call
+                         # (2026-09-01), decode time per utterance:
+                         #   length   base(local)   deepgram
+                         #     2.5s      3.03s        0.56s
+                         #      12s      2.98s        0.82s
+                         #      28s      4.54s        0.81s
+                         # and accuracy on the passage that broke the local models --
+                         # "unattached volumes", "overprovisioned", "platforms/networking" --
+                         # deepgram got all of them; base produced "out of time volumes" and
+                         # "WIMA", tiny produced "Vista, Dr. Acer" for "wastage".
+                         # Set back to faster-whisper to keep audio on-device (it still works,
+                         # it is just ~5s slower per question and less accurate here).
+                         #
+                         # WHY LOCAL DOES NOT FIT: local STT is the entire
                          # latency budget here AND it fights the video call for the same two
                          # cores. Measured 2026-09-01 on the same ~2.2s utterance with "base":
                          #     CPU idle                                     3.85s

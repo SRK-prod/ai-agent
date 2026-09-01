@@ -35,10 +35,21 @@ def main() -> None:
     e = s + int(args.seconds * sr)
     clip = np.clip(a[s:e] * args.gain, -1.0, 1.0)
 
-    out = sd.query_devices(kind="output")
-    print(f"playing {len(clip) / sr:.1f}s out of: {out['name']}")
+    # Target CABLE Input explicitly rather than the default output. Once the machine is set
+    # up correctly the Windows default is the real speakers (so the user can hear normally)
+    # and only the meeting app is pointed at the cable -- so playing to "default" would go to
+    # the speakers and test nothing.
+    device = None
+    for i, d in enumerate(sd.query_devices()):
+        if d["max_output_channels"] > 0 and "CABLE Input" in d["name"]:
+            device = i
+            break
+    if device is None:
+        raise SystemExit("no 'CABLE Input' output device found -- is VB-Cable installed?")
+
+    print(f"playing {len(clip) / sr:.1f}s into: {sd.query_devices(device)['name']}")
     print(f"clip level: peak={np.abs(clip).max():.3f} rms={np.sqrt(np.mean(clip**2)):.4f}")
-    sd.play(clip, sr)
+    sd.play(clip, sr, device=device)
     sd.wait()
     print("done -- watch the overlay")
 
