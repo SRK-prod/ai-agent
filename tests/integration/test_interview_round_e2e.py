@@ -81,10 +81,12 @@ class ScriptedClaude:
 
     def __init__(self, answer_fn=None):
         self.prompts: list[str] = []
+        self.systems: list[str] = []
         self._answer_fn = answer_fn or (lambda p: f"ANSWER<{p}>")
 
     def stream(self, prompt: str, system: str | None = None):
         self.prompts.append(prompt)
+        self.systems.append(system or "")
         text = self._answer_fn(prompt)
 
         async def gen():
@@ -96,6 +98,7 @@ class ScriptedClaude:
 
     async def complete(self, prompt: str, system: str | None = None) -> str:
         self.prompts.append(prompt)
+        self.systems.append(system or "")
         return self._answer_fn(prompt)
 
 
@@ -217,12 +220,15 @@ async def test_correction_answers_only_the_corrected_question(make_pipeline):
     await say(pipe, overlay, "Actually, I mean Kubernetes.", 5.0, 7.0)
 
     assert "Kubernetes" in overlay.visible, "the corrected question was not answered"
-    # The correction REPLACES the original -- it must not be answered as "ECS and also
-    # Kubernetes". Asserting only that Kubernetes appears is too weak: a plain revision
-    # merge also satisfies that while answering both readings, which is the actual bug.
-    assert "ECS" not in overlay.visible, (
-        "the superseded ECS reading survived into the answer -- the correction was merged "
-        "instead of replacing (requires _is_correction in the orchestrator)"
+    # The correction is enforced by injecting a CORRECTION block into the SYSTEM prompt
+    # ("the later statement REPLACES the earlier one -- answer ONLY the corrected
+    # question"), not by rewriting the question text. Assert on that, because that is the
+    # real mechanism: asserting "ECS" is absent from the answer would only be testing this
+    # file's echo-the-prompt stub, which cannot honour a system-prompt instruction.
+    assert pipe._claude.systems, "no system prompt was captured"
+    assert "CORRECTION" in pipe._claude.systems[-1], (
+        "the correction was merged as an ordinary revision -- the model was never told the "
+        "ECS reading is void, so it would answer both"
     )
 
 
@@ -337,8 +343,10 @@ def test_vad_cap_is_configured_and_sane():
 @pytest.mark.parametrize(
     "bad_opening",
     [
-        "I need to clarify what you're asking here -- are you asking me to redesign the "
-        "reference architecture, or are you asking something else about the setup?",
+        (
+            "I need to clarify what you're asking here -- are you asking me to redesign the "
+            "reference architecture, or are you asking something else about the setup?"
+        ),
         "Could you clarify which part of the design you mean?",
         "I need more context to answer this.",
         "The transcript appears to be incomplete, so I'll infer the question.",

@@ -49,10 +49,30 @@ def test_empty_text_is_ignored():
 
 
 def test_short_filler_with_bare_question_mark_is_filtered():
-    # real-world false positive that wasted a full retrieval+LLM call: "Okay, no?"
+    """Short filler ("Okay, no?") must never produce an answer, but short REAL follow-ups
+    ("Why Sonnet?", "Trade-offs?") must.
+
+    This is deliberately a two-layer guarantee, and the test was updated 2026-09-01 to
+    match where each layer actually lives. The detector used to reject every sub-N-word
+    utterance, which silently dropped the rapid-fire one-liners a real interviewer asks
+    after a long answer -- see the "EXCEPTION" comment in question_detector.detect(). So
+    the detector now admits anything ending in "?", and the orchestrator's
+    _is_acknowledgement_only strips the pure-filler ones before any LLM call. Asserting
+    `detector.detect(...) is None` here tested the old single-layer design and had been
+    failing ever since; what actually matters is that filler is never ANSWERED.
+    """
+    from meeting_copilot.pipeline.orchestrator import _is_acknowledgement_only
+
     detector = RuleBasedQuestionDetector(CFG)
-    assert detector.detect(_transcript("Okay, no?")) is None
-    assert detector.detect(_transcript("Right?")) is None
+
+    def would_be_answered(text: str) -> bool:
+        return detector.detect(_transcript(text)) is not None and not _is_acknowledgement_only(text)
+
+    for filler in ("Okay, no?", "Right?", "Yeah, sure?", "Okay."):
+        assert not would_be_answered(filler), f"filler reached the LLM: {filler!r}"
+
+    for real in ("Why Sonnet?", "Trade-offs?", "MCP?"):
+        assert would_be_answered(real), f"real one-line follow-up was dropped: {real!r}"
 
 
 def test_short_question_with_keyword_still_triggers():

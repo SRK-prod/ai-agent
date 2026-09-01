@@ -14,7 +14,6 @@ from __future__ import annotations
 import time
 
 import numpy as np
-import pytest
 
 from meeting_copilot.audio import capture as capture_module
 from meeting_copilot.config import AudioConfig
