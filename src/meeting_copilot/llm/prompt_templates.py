@@ -273,16 +273,18 @@ def _classify_category(question_text: str) -> str:
     # explicitly names Terraform state/drift/modules is IaC-shaped even if it also mentions
     # team count (e.g. "structure Terraform for 100 teams" is iac_terraform, not
     # platform_engineering -- the literal "terraform" keyword is the more specific signal).
-    # "design a Terraform..." questions are already claimed by is_design_phrasing above and
-    # correctly get the general "architecture" shape instead -- this bucket is for the
-    # non-design-phrased IaC questions ("how do you manage state", "how do you prevent
-    # drift", "how do you structure Terraform for N teams").
+    # Naming the IaC tool at all is enough. Until 2026-09-01 this was a list of narrow
+    # phrases ("terraform state", "terraform for aws and gcp", ...) which relied on
+    # is_design_phrasing catching every "design a Terraform..." question first. When that
+    # branch was changed the same day to fall through for delivery-tooling subjects, this
+    # list turned out to be too narrow to catch what fell through: "how are you going to
+    # design the terraform for multi cloud systems" matched NOTHING here and landed in
+    # default, i.e. a 180-word generic answer for an explicit Terraform question. Matching on
+    # the bare tool name closes that hole. Migration, HA/DR and troubleshooting are all
+    # checked earlier, so "migrate X to Y with Terraform" still routes to migration.
     if any(m in t for m in (
-        "terraform state", "terraform drift", "terraform module", "terraform modules",
-        "reusable module", "reusable terraform", "structure terraform",
-        "manage terraform", "terraform for aws and gcp", "terraform for multiple",
-        "terraform workspace", "terraform for 100", "terraform for 50",
-        "iac module", "infrastructure as code module", "prevent drift",
+        "terraform", "opentofu", "iac module", "infrastructure as code",
+        "reusable module", "prevent drift",
     )):
         return "iac_terraform"
 
