@@ -125,12 +125,18 @@ def _is_hallucinated(text: str) -> bool:
 
 
 def get_stt_engine(config: SttConfig | None = None):
-    """Engine factory driven by `stt.backend` (faster-whisper = CPU, mlx-whisper = M-series GPU)."""
+    """Engine factory driven by `stt.backend`:
+    faster-whisper = local CPU, mlx-whisper = local M-series GPU, deepgram = cloud (no CPU).
+    """
     cfg = config or get_config().stt
     if cfg.backend == "mlx-whisper":
         from meeting_copilot.stt.mlx_whisper_engine import MlxWhisperEngine
 
         return MlxWhisperEngine(cfg)
+    if cfg.backend == "deepgram":
+        from meeting_copilot.stt.deepgram_engine import DeepgramEngine
+
+        return DeepgramEngine(cfg)
     return FasterWhisperEngine(cfg)
 
 

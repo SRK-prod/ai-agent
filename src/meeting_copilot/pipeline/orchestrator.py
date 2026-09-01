@@ -35,6 +35,7 @@ from meeting_copilot.nlp.question_detector import get_question_detector
 from meeting_copilot.pipeline.events import (
     Answer,
     AudioHealth,
+    DiarizedSegment,
     RetrievedContext,
     SpeechSegment,
     Transcript,
@@ -486,6 +487,21 @@ def _is_acknowledgement_only(text: str) -> bool:
     return False
 
 
+class _NullDiarizer:
+    """Stand-in used when speaker.enabled is False: every segment is the far end.
+
+    Deliberately assigns ONE stable speaker id rather than a per-segment one. The
+    orchestrator does not compare speaker ids when merging fragments (see the note in
+    _handle_segment), but the id reaches the prompt as "Question (from X)", and a value
+    that changed every segment would read as a room full of people to the model.
+    """
+
+    def diarize(self, segment: SpeechSegment) -> DiarizedSegment:
+        return DiarizedSegment(
+            segment=segment, speaker_id="speaker_a", is_me=False, similarity_to_me=0.0
+        )
+
+
 class MeetingPipeline:
     def __init__(
         self,
@@ -501,7 +517,8 @@ class MeetingPipeline:
         self._cfg = get_config()
         self._capture = AudioCapture()
         self._vad = SileroVAD()
-        self._diarizer = SpeakerDiarizer()
+        # Skipping diarization avoids loading pyannote+torch at all -- see SpeakerConfig.enabled.
+        self._diarizer = SpeakerDiarizer() if self._cfg.speaker.enabled else _NullDiarizer()
         self._stt = SttStage()
         self._question_detector = get_question_detector()
         # Pure-LLM mode (default): both disabled, so skip loading the embedding model

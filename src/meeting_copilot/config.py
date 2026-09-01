@@ -36,6 +36,7 @@ class Secrets(BaseSettings):
     anthropic_api_key: str | None = Field(default=None, alias="ANTHROPIC_API_KEY")
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
     hf_token: str | None = Field(default=None, alias="HF_TOKEN")
+    deepgram_api_key: str | None = Field(default=None, alias="DEEPGRAM_API_KEY")
     qdrant_url: str = Field(default="http://localhost:6333", alias="QDRANT_URL")
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
     host: str = Field(default="127.0.0.1", alias="MEETING_COPILOT_HOST")
@@ -54,6 +55,13 @@ class Secrets(BaseSettings):
                 "ANTHROPIC_API_KEY", "calling the Anthropic Messages API (llm.backend=api)"
             )
         return self.anthropic_api_key
+
+    def require_deepgram_key(self) -> str:
+        if not self.deepgram_api_key:
+            raise MissingCredentialError(
+                "DEEPGRAM_API_KEY", "cloud transcription (stt.backend=deepgram)"
+            )
+        return self.deepgram_api_key
 
     def require_openai_key(self) -> str:
         if not self.openai_api_key:
@@ -84,6 +92,15 @@ class VadConfig(BaseModel):
 
 
 class SpeakerConfig(BaseModel):
+    # Diarization exists to drop the candidate's OWN voice before it is transcribed. That is
+    # only necessary when the capture stream can contain it. With the virtual-cable setup
+    # (BlackHole/VB-Cable) the app captures the meeting app's OUTPUT only -- the far end --
+    # so the candidate's microphone is never in this stream and is_me can never be true.
+    # Disabling then costs nothing and buys back a pyannote+torch model load (~1GB RSS) and
+    # ~0.3s of CPU per segment, which matters a lot on a 2-core machine that is also running
+    # the video call. Set True if the capture device could ever carry your own voice
+    # (system-wide loopback, an aggregate device, or a shared room mic).
+    enabled: bool = True
     embedding_model: str = "pyannote/embedding"
     window_seconds: float = 5.0
     window_overlap_seconds: float = 1.0
@@ -94,7 +111,15 @@ class SpeakerConfig(BaseModel):
 
 
 class SttConfig(BaseModel):
-    backend: Literal["faster-whisper", "mlx-whisper"] = "faster-whisper"
+    backend: Literal["faster-whisper", "mlx-whisper", "deepgram"] = "faster-whisper"
+    # deepgram only -- see stt/deepgram_engine.py for why a cloud engine exists at all.
+    deepgram_model: str = "nova-3"
+    # Deepgram caps keyterm prompting; the full vocabulary list is longer than the cap, and
+    # sending more than this is rejected rather than truncated server-side.
+    deepgram_max_keyterms: int = 100
+    # A cloud call must fail fast: the pipeline can survive losing one utterance, but not a
+    # request that hangs past the point where the answer would still be useful.
+    cloud_timeout_seconds: float = 8.0
     model_size: str = "distil-large-v3"
     device: Literal["auto", "cpu", "cuda", "mps"] = "auto"
     compute_type: str = "int8"

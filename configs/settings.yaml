@@ -39,6 +39,15 @@ vad:
                                 # loss (that is why the Mac never had this).
 
 speaker:
+  enabled: false        # WINDOWS/VB-Cable: OFF. Diarization exists to drop the candidate's
+                        # own voice before transcription, but this machine captures
+                        # "CABLE Output" -- the meeting app's OUTPUT, i.e. the far end only --
+                        # so your own mic is never in this stream and is_me can never fire.
+                        # Turning it off skips loading pyannote+torch entirely (~1GB RSS) and
+                        # saves ~0.3s of CPU per segment, which is real on a 2-core box that
+                        # is also running the video call.
+                        # Set back to true if the capture device could ever carry your voice:
+                        # system-wide loopback, an aggregate/multi-input device, or a room mic.
   embedding_model: pyannote/embedding
   window_seconds: 5.0
   window_overlap_seconds: 1.0
@@ -48,9 +57,22 @@ speaker:
   enrollment_db_path: data/speaker_enrollment.sqlite3
 
 stt:
-  backend: faster-whisper   # WINDOWS: no Apple GPU here -- faster-whisper on CPU. Slower than
-                         # the Mac's mlx-whisper (expect a few seconds per utterance), but the
-                         # only cross-platform option. (macOS used mlx-whisper.)
+  backend: faster-whisper   # faster-whisper = local CPU | mlx-whisper = Apple GPU | deepgram = cloud
+                         #
+                         # RECOMMENDED ON THIS MACHINE: deepgram. Local STT is the entire
+                         # latency budget here AND it fights the video call for the same two
+                         # cores. Measured 2026-09-01 on the same ~2.2s utterance with "base":
+                         #     CPU idle                                     3.85s
+                         #     CPU at 99% (Chrome + Docker + the call)     33.2s
+                         # No local model setting is both fast and accurate under that
+                         # contention -- bigger fixes the mis-transcriptions and blows the
+                         # latency budget, smaller does the reverse. Cloud transcription takes
+                         # STT off the CPU entirely (~0.3-0.6s network round trip that does not
+                         # degrade when the machine is busy) and is more accurate than "base".
+                         # To switch: put DEEPGRAM_API_KEY in .env and set backend: deepgram.
+                         # Trade-off: raw meeting audio then leaves the machine -- see the
+                         # module docstring in stt/deepgram_engine.py. Keep faster-whisper if
+                         # the audio must stay on-device.
   model_size: base      # WINDOWS/CPU: this box is a 2-core i5-7300U with no GPU, so STT is the
                       # entire latency budget. Chosen from measurement on a REAL recorded client
                       # call (scripts/transcribe_sample.py, 111s of speech, 2026-09-01) -- NOT
