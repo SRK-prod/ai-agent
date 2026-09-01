@@ -226,6 +226,17 @@ _CLARIFICATION_SEEKING_PATTERNS = (
     r"\bplease (?:clarify|specify|restate|elaborate on what)\b",
     r"\bmy best guess\b.{0,40}\bif you\b",
     r"\bare you asking about\b.{0,80}\bor\b.{0,80}\bor\b",  # the "A, B, or C?" menu pattern
+    # Reached the overlay live 2026-09-01 on a garbled transcript, unfiltered: "I need to
+    # clarify what you're asking here -- are you asking me to redesign the AIOps reference
+    # architecture ... or are you asking something else about the multi-cloud setup?"
+    # Two gaps: (a) "I need to clarify" is not "I need YOU to clarify", which is what the
+    # pattern above matched; (b) the menu pattern required THREE branches ("A, B, or C"),
+    # but the real failure offered only two. Both are the same behaviour and both are banned.
+    r"\bi (?:need|want|have) to clarify\b",
+    r"\b(?:just|first) to clarify\b",
+    r"\bare you asking\b.{0,100}\bor are you\b",  # two-option menu: "are you asking X or are you Y"
+    r"\bdo you mean\b.{0,80}\bor\b",
+    r"\bwhat exactly (?:do you|are you) (?:mean|asking|referring)\b",
 )
 _CLARIFICATION_RE = re.compile("|".join(_CLARIFICATION_SEEKING_PATTERNS), re.IGNORECASE)
 

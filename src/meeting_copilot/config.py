@@ -76,6 +76,11 @@ class VadConfig(BaseModel):
     threshold: float = 0.5
     min_speech_ms: int = 250
     min_silence_ms: int = 300
+    # Force-close a segment once speech has run this long, even with no silence yet, so a
+    # continuously-talking speaker still gets transcribed incrementally instead of the whole
+    # pipeline stalling until they stop. 0 disables. Only safe when STT decode cost is
+    # roughly linear in audio length -- see the comment in vad/silero_vad.py.
+    max_speech_ms: int = 12000
 
 
 class SpeakerConfig(BaseModel):
@@ -93,6 +98,13 @@ class SttConfig(BaseModel):
     model_size: str = "distil-large-v3"
     device: Literal["auto", "cpu", "cuda", "mps"] = "auto"
     compute_type: str = "int8"
+    # faster-whisper's own default is beam_size=5 -- five decode hypotheses searched in
+    # parallel. On a GPU that is nearly free; on a weak CPU it multiplies decode time for
+    # a marginal accuracy gain. 1 = greedy decoding.
+    beam_size: int = 5
+    # 0 = let CTranslate2 choose (all cores). Pin it when the machine has few cores and
+    # other pipeline stages (pyannote diarization) are competing for them.
+    cpu_threads: int = 0
     chunk_seconds: float = 2.5
     chunk_overlap_seconds: float = 0.5
     language: str = "en"
@@ -131,6 +143,39 @@ class SttConfig(BaseModel):
     # live: without this, "LangChain, LangGraph, LlamaIndex" transcribed as "line chain,
     # line graph, non-index", "Gen AI" as "gender TV", "JIRA" as "PIA". Passed as
     # initial_prompt, which biases decoding without forcing verbatim repetition.
+    #
+    # NOTE (2026-09-01, scripts/bench_stt_opts.py on the Windows/CPU box): this full
+    # ~2100-char hint is NOT the best-performing option. It is long enough to dilute the
+    # decoder's attention AND it costs decode time. Measured on one utterance, model=tiny:
+    #   full hint (2121 chars)  2.13s -> "OOM killed",  "crash loop back off"   (worse)
+    #   short hint (147 chars)  1.87s -> "OOMKilled",   "CrashLoopBackOff"      (better)
+    #   no hint                 1.58s -> "OOM killed",  "crash loop back off"
+    # So the short hint is both faster than the full one and the only variant that kept the
+    # compound technical terms intact. `vocabulary_hint_short` below is what the engine uses
+    # by default now; the full list is kept because it was built from real transcription
+    # failures and is the right fallback on a machine fast enough not to care.
+
+    # Deliberately short: only terms Whisper actually mis-hears PHONETICALLY, and only ones
+    # that plausibly occur in these interviews. Adding more here has been measured to make
+    # transcription worse, not better -- do not grow this back into a full glossary.
+    vocabulary_hint_short: str = (
+        "Kubernetes, EKS, AKS, OOMKilled, CrashLoopBackOff, ALB, NLB, Terraform, OpenTofu, "
+        "IAM, KMS, Lambda, DynamoDB, Aurora, Bedrock, Agentic AI, RAG, CI/CD, GitOps, "
+        "ArgoCD, SLO, SRE, AIOps, LangChain, LangGraph, GenAI, JIRA, Databricks"
+    )
+    # Which of the two above the engine passes as initial_prompt. "short" is the measured
+    # default on this hardware; "full" restores the original behaviour; "none" is fastest
+    # but loses the compound terms.
+    vocabulary_hint_mode: Literal["short", "full", "none"] = "short"
+
+    @property
+    def initial_prompt(self) -> str | None:
+        """The initial_prompt actually handed to faster-whisper -- see vocabulary_hint_mode."""
+        if self.vocabulary_hint_mode == "none":
+            return None
+        if self.vocabulary_hint_mode == "full":
+            return self.vocabulary_hint
+        return self.vocabulary_hint_short
 
 
 class QuestionDetectorConfig(BaseModel):

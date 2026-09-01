@@ -4,6 +4,15 @@
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
 
+# Make PATH (Docker CLI) and the HF model cache location explicit so the backend,
+# however it's launched, finds the models pre-downloaded on D: instead of re-fetching
+# to %USERPROFILE%\.cache (and failing on the gated pyannote model).
+$env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User") + ";C:\Program Files\Docker\Docker\resources\bin"
+if (-not $env:HF_HOME) {
+    $u = [Environment]::GetEnvironmentVariable("HF_HOME","User")
+    $env:HF_HOME = if ($u) { $u } else { "D:\meeting-copilot\hf-cache" }
+}
+
 Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'uvicorn.exe'" |
     Where-Object { $_.CommandLine -like "*meeting_copilot*" } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }

@@ -18,7 +18,11 @@ dependencies = [
     "pydantic-settings>=2.6",
     "pyyaml>=6.0",
     "sounddevice>=0.5",
-    "numpy>=1.26,<2.0",
+    # numpy<2.0 has no cp313 wheels (whole 1.26.x line predates Python 3.13), which
+    # forces a from-source build. Relaxed to a 2.x with prebuilt cp313 wheels --
+    # torch 2.7, scipy>=1.14, faster-whisper and pyannote all support numpy 2, and
+    # the codebase uses no numpy-2-removed APIs. (Windows/py3.13.)
+    "numpy>=1.26,<2.3",
     "scipy>=1.14",
     "noisereduce>=3.0",
     "silero-vad>=5.1",

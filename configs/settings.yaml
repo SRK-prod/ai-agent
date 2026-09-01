@@ -4,10 +4,12 @@ audio:
   sample_rate: 16000
   channels: 1
   block_ms: 30                 # capture callback block size
-  input_device: "BlackHole"    # PRODUCTION setting: captures the meeting call's remote audio
-                                # (the interviewer), routed here via your Multi-Output Device.
-                                # Your own mic is never captured -- by design, so your own
-                                # voice can't be mistaken for a question.
+  input_device: "CABLE Output (VB-Audio Virtual Cable)"  # WINDOWS: capture side of VB-Audio
+                                # Virtual Cable -- carries the meeting call's remote audio (the
+                                # interviewer), routed there by setting the meeting app's speaker
+                                # output to "CABLE Input". Your own mic is never captured -- by
+                                # design. If list_input_devices() shows a different exact string,
+                                # match it here. (macOS used "BlackHole".)
   noise_reduction: true
 
 vad:
@@ -21,6 +23,20 @@ vad:
                                 # to stitch back together downstream), at the cost of ~300ms
                                 # extra latency before an answer starts. Worth it: a correctly
                                 # captured whole question beats a fast partial one.
+  max_speech_ms: 12000          # force-close a segment after 12s of continuous speech even if
+                                # the speaker hasn't paused. Added 2026-09-01: silence was the
+                                # ONLY thing that closed a segment, so an interviewer talking
+                                # without a break produced one huge segment and nothing reached
+                                # STT until they stopped -- measured live, a 28.9s segment took
+                                # 11.1s to decode and the answer landed 14s after the question,
+                                # vs 5.1s for a normal 2.4s segment. Safe here because decode
+                                # cost is LINEAR on this CPU (0.435s per second of audio, no
+                                # meaningful per-call floor), so splitting costs nothing extra;
+                                # the orchestrator's fragment-merge + answer-revision window
+                                # stitch a mid-question cut back together. 0 disables.
+                                # NOTE: re-measure before enabling on Apple-GPU/large-v3-turbo,
+                                # where a ~2.5s fixed encoder cost per call makes cutting a net
+                                # loss (that is why the Mac never had this).
 
 speaker:
   embedding_model: pyannote/embedding
@@ -32,16 +48,34 @@ speaker:
   enrollment_db_path: data/speaker_enrollment.sqlite3
 
 stt:
-  backend: mlx-whisper   # Apple Silicon GPU via mlx-whisper -- measured (warm): 6s audio=0.33s,
-                         # 30s audio=0.32s, vs 1.1s/5.5s on faster-whisper CPU. Switch back to
-                         # faster-whisper on non-M-series machines.
-  model_size: large-v3-turbo   # upgraded from "small" 2026-08-07 after a real interview call
-                      # showed heavy hallucination (repeated-word loops) and mangled technical
-                      # terms (OOMKilled -> "OOMCade", CrashLoopBackOff -> "crash look back
-                      # off") on real-world noisy/cross-talk audio -- measured 3.1s/30s, still
-                      # well under real-time
-  device: auto                  # auto|cpu|cuda|mps (faster-whisper only supports cpu/cuda; mps falls back to cpu)
+  backend: faster-whisper   # WINDOWS: no Apple GPU here -- faster-whisper on CPU. Slower than
+                         # the Mac's mlx-whisper (expect a few seconds per utterance), but the
+                         # only cross-platform option. (macOS used mlx-whisper.)
+  model_size: base      # WINDOWS/CPU: this box is a 2-core i5-7300U with no GPU, so STT is the
+                      # entire latency budget. Chosen from measurement on a REAL recorded client
+                      # call (scripts/transcribe_sample.py, 111s of speech, 2026-09-01) -- NOT
+                      # from synthesized speech, which flattered the small models badly:
+                      #   model  decode      "wondering if"  "platforms/     "wastage"
+                      #                                       networking"
+                      #   tiny   11s (0.10x)  "putting if" X  "CloudFlaw,  X  "Vista, Dr. Acer" XX
+                      #                                        network 8"
+                      #   base   18s (0.16x)  ok              ok              "missed"          X
+                      #   small  68s (0.61x)  ok              ok              ok
+                      #   large-v3-turbo ~45-50s per utterance -- queue backed up, answers 98s late
+                      # base is the knee of the curve: near-tiny speed, but it recovers the
+                      # structurally important words tiny destroys. tiny is NOT usable -- decoding
+                      # "wastage" as "Vista, Dr. Acer" feeds the LLM noise it will answer from.
+                      # For a typical 8s interview question that is ~1.3s of decode, which keeps
+                      # end-to-end inside the ~4s target.
+                      # If transcription accuracy matters more than speed on a given day, set
+                      # "small" -- same quality as the reference column above, ~5s decode on an
+                      # 8s question. (macOS ran large-v3-turbo on the Apple GPU, hence no issue.)
+  device: cpu                   # auto|cpu|cuda|mps -- forced to cpu on this machine (Intel HD 620, no CUDA)
   compute_type: int8
+  beam_size: 1        # greedy decoding. faster-whisper defaults to 5 (five hypotheses searched
+                      # in parallel) which is cheap on a GPU and expensive on 2 CPU cores --
+                      # measured 18.2s -> 14.0s on "small" here for no transcript difference.
+  cpu_threads: 0      # 0 = CTranslate2 picks (all cores). Pin only if diarization starves it.
   chunk_seconds: 2.5
   chunk_overlap_seconds: 0.5
   language: en
@@ -1057,11 +1091,12 @@ cache:
 overlay:
   always_on_top: true
   opacity: 0.92
-  hotkeys:  # pynput GlobalHotKeys syntax: modifiers wrapped in <>, e.g. <cmd>+<shift>+h
-    hide: "<cmd>+<shift>+h"
-    pin: "<cmd>+<shift>+p"
-    expand: "<cmd>+<shift>+e"
-    copy: "<cmd>+<shift>+c"
+  hotkeys:  # pynput GlobalHotKeys syntax. WINDOWS: <cmd>+<shift>+* combos are reserved by the
+            # OS (snap, virtual desktops) and won't register for a global hotkey -- use ctrl+alt.
+    hide: "<ctrl>+<alt>+h"
+    pin: "<ctrl>+<alt>+p"
+    expand: "<ctrl>+<alt>+e"
+    copy: "<ctrl>+<alt>+c"
 
 performance_targets_ms:
   speech_detection: 50

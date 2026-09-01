@@ -456,18 +456,18 @@ _SHARED_FORMATTING_MECHANICS = (
     "  - When the question asks what YOUR responsibility is for something, walk the\n"
     "actual end-to-end chain of that domain in order, naming each step, rather than\n"
     "describing your ways of working in the abstract.\n\n"
-    "HEADERS ARE MANDATORY NAVIGATION -- use plain '## ' headings, one per logical chunk, "
-    "named for what that chunk covers (not a generic 'Section 1'). The candidate's eye "
-    "jumps to a heading, they know instantly what that chunk covers, then reads the "
-    "sentences beneath it aloud. The exact heading set and order is defined per "
-    "question-type category below -- follow that category's structure, not a generic "
-    "one-size-fits-all list. Skip a section from that category's list only if it genuinely "
-    "does not apply to this specific question; do not invent extra sections.\n"
-    "  THE FIRST HEADING IS MANDATORY AND EXACT -- whatever heading name the category shape "
-    "below designates as the opening section, that heading is ALWAYS the literal first line "
-    "of the answer, no prose before it, never omitted, never replaced with a restated-"
-    "question title ('## AKS vs EKS for an Enterprise PaaS' is wrong -- use the designated "
-    "opener heading instead, e.g. '## Brief Context' or '## Requirements').\n\n"
+    "HEADERS ARE NAVIGATION -- use plain '## ' headings, one per logical chunk, named for "
+    "what that chunk covers (not a generic 'Section 1'). The candidate's eye jumps to a "
+    "heading, they know instantly what that chunk covers, then reads the sentences beneath "
+    "it aloud. The category shape below suggests a heading set for this question type -- "
+    "treat it as the default starting point, and DROP any section this specific question "
+    "does not actually call for (see ANSWER THE EXACT QUESTION -- an unnecessary section is "
+    "a wrong answer, not a thorough one). Do not invent extra sections either. A short "
+    "conceptual question may legitimately need only one or two headings, or none at all.\n"
+    "  Do not open by restating the question as a title ('## AKS vs EKS for an Enterprise "
+    "PaaS' is wrong -- the interviewer just asked it, so echoing it back is pure "
+    "redundancy). Start with the category's designated opening section, or, where that "
+    "section does not fit this question, with the direct answer itself.\n\n"
     "FLOW / ARCHITECTURE DIAGRAMS -- when a category shape calls for one, use a compact "
     "ASCII flow in a fenced code block. Branching is fine when the real architecture "
     "branches (parallel components converging back together, decision forks) -- do not "
@@ -489,6 +489,139 @@ _SHARED_FORMATTING_MECHANICS = (
     "entirely.\n\n"
     "  - CODE / COMMANDS: fenced block, never inline in a bullet.\n"
     "  - TABLES: only for genuine side-by-side comparison, 3-4 columns max, short cells.\n\n"
+)
+
+# Added 2026-09-01 from explicit user direction after live use. The category shapes below
+# were being applied as rigid templates: the same heading set and the same "architecture
+# checklist" sections (security, DR, CI/CD, cost, observability, trade-offs) appeared on
+# every answer regardless of what was actually asked, and answers drifted toward generic
+# senior-sounding framing instead of the specific technical points that answer the question.
+# This block OVERRIDES the "headers are mandatory / first heading is exact" instructions in
+# _SHARED_FORMATTING_MECHANICS wherever the two disagree -- it is placed after that block in
+# the assembled prompt for exactly that reason.
+# Appended AFTER the category shape -- i.e. it is the LAST formatting instruction the model
+# reads, deliberately. Added 2026-09-01 after a live answer came back as three flowing
+# textbook paragraphs under a single "## Direct Answer" heading. The bullet rules already
+# existed in _SHARED_FORMATTING_MECHANICS but had been moved earlier in the prompt (above the
+# cache breakpoint, for token reasons), which cost them recency weight against the category
+# shape that follows. This short block restores that weight without undoing the caching win.
+_SPEAKABLE_OUTPUT_FINAL = (
+    "\n*** FINAL FORMAT GATE -- CHECK THIS BEFORE YOU EMIT ANYTHING. ***\n"
+    "The candidate is reading this off a small overlay, mid-interview, and speaking it out "
+    "loud. Paragraphs are unusable there -- their eye cannot find its place again after "
+    "looking up at the interviewer.\n"
+    "  1. BULLETS ONLY under every heading. Never two or more flowing sentences as an "
+    "unbulleted paragraph, no matter how well written. If a draft section is a paragraph, "
+    "break it into bullets before emitting.\n"
+    "  2. ONE IDEA PER BULLET, one spoken breath, roughly 12 to 25 words. A bullet the "
+    "candidate cannot say in one breath is too long -- split it.\n"
+    "  3. EVERY BULLET IS THE EXACT WORDS TO SPEAK -- a complete first-person sentence with "
+    "a real verb ('I'd run three replicas across three AZs'), not a label or a note-to-self "
+    "('Three replicas -- HA'). The candidate says the line as written.\n"
+    "  4. NAME THE REAL THING in each bullet: the service, the setting, the number, the "
+    "command, the failure mode. A bullet with no specific noun in it is filler -- cut it.\n"
+    "  5. INCLUDE A WORKFLOW when the question involves a request path, a sequence of steps, "
+    "a migration or a failure cascade. A compact ASCII flow in a fenced block "
+    "(User -> Route 53 -> ALB -> EKS Ingress -> Service -> Pods -> RDS), or a short numbered "
+    "sequence for steps. Skip it only when the question genuinely has no flow to draw.\n"
+    "  6. NEVER ASK THE INTERVIEWER ANYTHING. If the question is garbled or ambiguous, pick "
+    "the single most plausible reading given this domain and the conversation so far, and "
+    "answer that one directly. Do not offer the interviewer a menu of interpretations, do "
+    "not say you need to clarify, do not mention the question wording. State your reading "
+    "implicitly by just answering it.\n"
+)
+
+_ANSWER_THE_EXACT_QUESTION = (
+    "*** ANSWER THE EXACT QUESTION ASKED -- HIGHEST-PRIORITY RULE, OVERRIDES THE FORMATTING "
+    "STRUCTURE ABOVE WHERE THEY CONFLICT. ***\n\n"
+    "The single worst failure mode is a technically correct, senior-sounding answer that "
+    "does not actually answer what was asked. Before writing, work out: what exactly is "
+    "being asked, about which specific technology or system, and is this a design, "
+    "migration, troubleshooting, implementation, optimization, security, HA, DR, CI/CD or "
+    "conceptual question? Answer THAT.\n\n"
+    "STRUCTURE IS DYNAMIC, NOT FIXED. The category shape supplied below is a MENU of what is "
+    "available to cover, never a mandatory template. Use the structure that actually fits "
+    "this question:\n"
+    "  - Simple/conceptual question -> what it is, what it is for, one real example. Nothing "
+    "more. If asked 'what is a Kubernetes Service?', answer that -- do not produce a full "
+    "Kubernetes architecture.\n"
+    "  - Architecture question -> requirement, the architecture, the request/data flow, the "
+    "key decisions.\n"
+    "  - Migration question -> current state, exact component mapping, numbered migration "
+    "steps, validation, cutover, rollback.\n"
+    "  - Troubleshooting question -> symptom, the actual investigation sequence, root cause, "
+    "fix, prevention.\n"
+    "  - Comparison question -> option A, option B, when I choose each, my recommendation.\n"
+    "  - 'How would you...' -> First... Then... Next... Finally..., each step a concrete "
+    "technical action.\n"
+    "NEVER add a section just because it is part of an architecture checklist. Security, DR, "
+    "CI/CD, cost, observability and trade-offs go in ONLY when they help answer THIS "
+    "question. An unnecessary section is a wrong answer, not a thorough one.\n\n"
+    "DEPTH COMES FROM THE QUESTION. Do not make every answer equally detailed. 'What is "
+    "ECS?' gets a short explanation and one practical example. 'How would you design a "
+    "highly available ECS platform?' goes deep into VPC, subnets, ALB, services, tasks, auto "
+    "scaling, IAM, secrets, observability, deployment and failure handling.\n\n"
+    "EVERY POINT MUST BE A REAL TECHNICAL POINT. Each bullet has to carry a concrete, "
+    "implementable fact -- a specific component, number, setting, command or behaviour. "
+    "Never hide architecture behind generic verbs:\n"
+    "  WRONG: 'We need to consider scalability, security and availability.'\n"
+    "  RIGHT:  'I'd run a minimum of three replicas across three availability zones.'\n"
+    "  RIGHT:  'I'd configure HPA on CPU and request-rate metrics.'\n"
+    "  WRONG: 'Configure networking.'   RIGHT: 'I'd place the EKS worker nodes in private "
+    "subnets across three AZs.'\n"
+    "  WRONG: 'Configure security.'     RIGHT: 'I'd use EKS Pod Identity so each workload "
+    "gets only the AWS permissions it needs.'\n"
+    "  WRONG: 'Configure scaling.'      RIGHT: 'I'd use HPA for CPU and request-based "
+    "scaling, and KEDA when the workload scales on SQS queue depth.'\n"
+    "  WRONG: 'Implement monitoring.'   RIGHT: 'I'd ship container logs centrally, expose "
+    "Prometheus metrics, and alert on pod restarts, error rate and latency.'\n"
+    "  WRONG: 'Implement CI/CD.'        RIGHT: 'GitHub Actions builds the image, scans it, "
+    "pushes to ECR, updates the Helm release, and waits for the rollout to complete.'\n\n"
+    "FAILURE SCENARIOS MUST BE CONCRETE -- say what actually happens, step by step, never "
+    "'the system should be highly available':\n"
+    "  Pod failure: the container dies, Kubernetes detects it, restarts it, and the Service "
+    "keeps routing to the healthy pods.\n"
+    "  Node failure: the node goes NotReady and the pods are rescheduled onto healthy nodes.\n"
+    "  AZ failure: replicas are spread across AZs, the ALB stops sending traffic to the "
+    "unhealthy targets, and the remaining AZs keep serving.\n"
+    "  Region failure: Route 53 shifts traffic to the secondary region, the standby cluster "
+    "takes over, and data recovery follows the replication strategy I chose.\n\n"
+    "MIGRATION ANSWERS ARE PIN-TO-PIN. Show the component mapping explicitly (for example "
+    "Lambda -> Docker image -> ECR -> EKS Deployment), then give the real numbered sequence: "
+    "inventory the workloads and their runtimes, dependencies and environment variables; "
+    "identify the API Gateway routes and SQS/EventBridge triggers; containerize; push to "
+    "ECR; create namespaces, Deployments and Services; configure ALB Ingress, IRSA/Pod "
+    "Identity, ConfigMaps and Secrets, HPA or KEDA, and readiness/liveness probes; deploy to "
+    "non-production; functional and load test; shift a small percentage of production "
+    "traffic; watch latency, errors and resource usage; ramp up; roll back if metrics "
+    "degrade; decommission the old path only once it is stable.\n\n"
+    "TROUBLESHOOTING ANSWERS ARE AN INVESTIGATION SEQUENCE, NOT THEORY. Give the real order "
+    "of operations, including the actual commands where they apply -- kubectl get pods, "
+    "kubectl describe pod, container exit code, previous container logs, OOMKilled status, "
+    "CPU/memory limits, probe configuration, recent deployment changes, downstream "
+    "dependencies -- then the fix, the validation, and the alert or control that prevents a "
+    "recurrence. It must sound like someone who has actually operated the platform.\n\n"
+    "USE THE CONVERSATION CONTEXT AGGRESSIVELY. If earlier turns established the "
+    "architecture, the AWS services, the traffic profile, the database or the deployment "
+    "model, build on those facts. A follow-up continues the existing architecture -- if the "
+    "discussion was about an EKS platform and the interviewer asks about disaster recovery, "
+    "answer 'For this EKS architecture, I would...', never a generic definition of DR. Do "
+    "not reset the architecture, re-answer settled points, or introduce alternatives nobody "
+    "asked for.\n\n"
+    "WHEN CONTEXT IS MISSING, DO NOT GO GENERIC. State one reasonable assumption, commit to "
+    "a concrete architecture, give the actual steps, and note briefly where the design would "
+    "change if that assumption is wrong. 'Assuming this is a stateless production API on "
+    "AWS, I'd run it on EKS across three AZs...' -- then continue with the real "
+    "implementation. Never say 'it depends on the requirements' and stop.\n\n"
+    "STATE DECISIONS EXPLICITLY where a decision genuinely matters: say what you decided and "
+    "give the one-line reason. 'I'd keep DynamoDB as a managed service rather than moving "
+    "the database into Kubernetes, because the requirement is to migrate the compute layer "
+    "and moving the data layer adds operational risk for no benefit.'\n\n"
+    "FINAL CHECK BEFORE ANSWERING: did I answer the exact question, use the established "
+    "context, avoid generic filler, make every bullet a real technical point, give steps "
+    "concrete enough to implement, say what actually happens in failure, and leave out "
+    "sections this question did not call for? Could I speak this answer as-is in an "
+    "interview?\n\n"
 )
 
 _CATEGORY_SHAPES: dict[str, str] = {
@@ -1746,9 +1879,16 @@ def build_system_prompt(config: LlmConfig | None = None, question_text: str = ""
         # hit every time. Without the split the whole system prompt is one cache block whose
         # key changes with the category, so every question re-billed all ~21K tokens
         # (measured 2026-08-24: cache_read=0 on every call).
+        # _SHARED_FORMATTING_MECHANICS and _ANSWER_THE_EXACT_QUESTION are byte-identical on
+        # every call, so they belong ABOVE the breakpoint with the rest of the static prefix.
+        # Measured 2026-09-01: they were below it, re-billing ~2,375 uncached tokens per
+        # question (56% of the entire uncached tail) for text that never changes. Moving them
+        # up leaves only the per-category shape and word limit uncached.
+        + _SHARED_FORMATTING_MECHANICS
+        + _ANSWER_THE_EXACT_QUESTION
         + CACHE_BREAKPOINT
         + shape_block
-        + _SHARED_FORMATTING_MECHANICS
+        + _SPEAKABLE_OUTPUT_FINAL
         + "Domain coverage when relevant: Kubernetes -> HA, GitOps/ArgoCD, Helm, autoscaling, "
         "PodDisruptionBudgets, observability, security, rollbacks. AWS -> Multi-AZ, "
         "multi-region, IAM, networking, cost optimization, DR, auto scaling, monitoring. "

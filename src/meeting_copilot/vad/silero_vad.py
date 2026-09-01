@@ -39,6 +39,9 @@ class SileroVAD:
             min_silence_duration_ms=self._cfg.min_silence_ms,
         )
 
+        # 0 disables the cap (the original behaviour: only silence ever ends a segment).
+        self._max_speech_samples = int(self._cfg.max_speech_ms / 1000 * self._sample_rate)
+
         self._buffer = np.zeros(0, dtype=np.float32)
         self._speech_chunks: list[np.ndarray] = []
         self._speech_start_time: float | None = None
@@ -61,6 +64,43 @@ class SileroVAD:
 
                 if self._in_speech:
                     self._speech_chunks.append(chunk)
+
+                    # FORCED CUT ON A LONG UTTERANCE. Without this the only thing that ever
+                    # closes a segment is min_silence_ms of silence, so an interviewer who
+                    # talks continuously produces one enormous segment and NOTHING reaches
+                    # STT until they finally stop. Measured live 2026-09-01: a 28.9s segment
+                    # took 11.1s to decode, so the answer appeared 14s after the question --
+                    # while a normal 2.4s segment answered in 5.1s.
+                    #
+                    # Safe to cut here because decode cost on this CPU is LINEAR in duration
+                    # (measured 0.435s per second of audio, ~zero fixed per-call overhead),
+                    # so splitting an utterance costs nothing extra in total. That is the
+                    # opposite of the Apple-GPU/large-v3-turbo case, where a ~2.5s fixed
+                    # encoder floor per call meant chunking multiplied cost -- do not carry
+                    # this setting back to a machine with that profile without re-measuring.
+                    #
+                    # A cut mid-question is handled downstream: the orchestrator's fragment
+                    # merge (_FRAGMENT_MERGE_GAP_SECONDS) and answer-revision window fold the
+                    # continuation into the same answer rather than starting a second one.
+                    if (
+                        self._max_speech_samples
+                        and sum(len(c) for c in self._speech_chunks) >= self._max_speech_samples
+                    ):
+                        samples = np.concatenate(self._speech_chunks)
+                        start_time = self._speech_start_time or frame.timestamp
+                        duration_ms = len(samples) / self._sample_rate * 1000
+                        # Keep _in_speech True and carry on accumulating -- this is a cut in a
+                        # continuing utterance, not the end of one, so the VAD iterator's own
+                        # state is deliberately NOT reset.
+                        self._speech_chunks = []
+                        self._speech_start_time = frame.timestamp
+                        logger.debug(f"VAD forced cut at max length: {duration_ms:.0f}ms")
+                        yield SpeechSegment(
+                            samples=samples,
+                            sample_rate=self._sample_rate,
+                            start_time=start_time,
+                            end_time=frame.timestamp,
+                        )
 
                 event = self._iterator(chunk, return_seconds=False)
                 if not event:

@@ -61,7 +61,11 @@ class MlxWhisperEngine:
             samples,
             path_or_hf_repo=self._repo,
             language=self._cfg.language,
-            initial_prompt=self._cfg.vocabulary_hint,
+            # See SttConfig.vocabulary_hint_mode: measured that a SHORT hint transcribes
+            # compound technical terms ("OOMKilled", "CrashLoopBackOff") better than the full
+            # glossary, which is long enough to dilute the decoder. Set
+            # stt.vocabulary_hint_mode: full in configs/settings.yaml to restore the old list.
+            initial_prompt=self._cfg.initial_prompt,
             # condition_on_previous_text=False is the single most important accuracy setting
             # here. With it True (the default), each window is conditioned on the previously
             # decoded text -- so one garbled decode cascades, producing the runaway repetition

@@ -42,7 +42,10 @@ class FasterWhisperEngine:
             f"device={device} compute_type={self._cfg.compute_type}"
         )
         self._model = WhisperModel(
-            self._cfg.model_size, device=device, compute_type=self._cfg.compute_type
+            self._cfg.model_size,
+            device=device,
+            compute_type=self._cfg.compute_type,
+            cpu_threads=self._cfg.cpu_threads,
         )
 
     def transcribe_samples(self, samples, sample_rate: int) -> str:
@@ -54,9 +57,18 @@ class FasterWhisperEngine:
         segments, _info = self._model.transcribe(
             samples,
             language=self._cfg.language,
-            condition_on_previous_text=True,
+            beam_size=self._cfg.beam_size,
+            # False, not True: each VAD segment is an independent utterance here, so there is
+            # no previous text worth conditioning on -- and conditioning is the known trigger
+            # for Whisper's repetition-loop hallucinations (the exact failure _is_hallucinated
+            # below exists to catch). Measured no transcript regression, slightly faster.
+            condition_on_previous_text=False,
             vad_filter=False,  # our own Silero VAD already gated this to a speech segment
-            initial_prompt=self._cfg.vocabulary_hint,
+            # Skip timestamp-token generation: the pipeline only ever uses the joined text
+            # (segment boundaries come from Silero VAD, not from Whisper), so the decoder is
+            # paying to emit tokens nothing reads. Measured 2.13s -> 1.76s on this CPU.
+            without_timestamps=True,
+            initial_prompt=self._cfg.initial_prompt,
         )
         return " ".join(s.text.strip() for s in segments).strip()
 
