@@ -1,6 +1,8 @@
 from meeting_copilot.config import LlmConfig
 from meeting_copilot.llm.answer_optimizer import (
+    _DEFINITION_MAX_WORDS,
     AnswerOptimizer,
+    _cap_definition_length,
     detect_format_type,
     parse_confidence,
 )
@@ -58,3 +60,26 @@ def test_optimizer_does_not_flag_high_confidence():
     answer = optimizer.optimize(context, "Confident answer.\nCONFIDENCE: 95")
     assert answer.low_confidence is False
     assert "[Low Confidence]" not in answer.text
+
+
+def test_cap_definition_keeps_short_bullet_block_untouched():
+    text = "* OpenTelemetry -- vendor-neutral observability framework.\n* Metrics, logs and traces."
+    assert _cap_definition_length(text) == text
+
+
+def test_cap_definition_drops_whole_bullets_without_flattening():
+    """The overlay is unreadable if capping joins bullets onto one line -- the failure the
+    pre-2026-09-02 sentence-based implementation would have caused on a bulleted answer."""
+    text = "\n".join(f"* Bullet number {i} carrying roughly eight words here." for i in range(12))
+    capped = _cap_definition_length(text)
+    lines = capped.splitlines()
+    assert len(capped.split()) <= _DEFINITION_MAX_WORDS
+    assert len(lines) < 12, "expected trailing bullets to be dropped"
+    assert all(ln.startswith("* ") for ln in lines), "bullets must stay one per line"
+
+
+def test_cap_definition_falls_back_to_sentences_for_prose():
+    text = " ".join(f"Sentence number {i} runs on for a good few words." for i in range(12))
+    capped = _cap_definition_length(text)
+    assert len(capped.split()) <= _DEFINITION_MAX_WORDS
+    assert "\n" not in capped

@@ -10,17 +10,34 @@ from meeting_copilot.pipeline.events import Answer, DetectedQuestion, RetrievedC
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z\"'])")
 _DEFINITION_MAX_SENTENCES = 3
-_DEFINITION_MAX_WORDS = 95
+_DEFINITION_MAX_WORDS = 70
+_BULLET_PREFIXES = ("*", "-", "•")
 
 
 def _cap_definition_length(text: str) -> str:
-    """Deterministic backstop for the `definition` category's 3-sentence, ~60-90-word
-    target. Prompt instructions alone plateaued at 104-127 words even after two rounds of
-    tightening (measured 2026-08-25) -- a live interview definition answer needs a hard
-    guarantee, not a best-effort one, the same reasoning as the clarification backstop.
-    No-op if the answer is already within budget (the normal case). Drops whole sentences
-    from the end rather than word-truncating mid-sentence -- a dangling clause ("...before.")
-    is unspeakable, a clean 2-sentence answer is not."""
+    """Deterministic backstop for the `definition` category's short keyword block. Prompt
+    instructions alone plateaued at 104-127 words even after two rounds of tightening
+    (measured 2026-08-25) -- a live interview definition answer needs a hard guarantee, not
+    a best-effort one, the same reasoning as the clarification backstop. No-op if the answer
+    is already within budget (the normal case).
+
+    Drops whole BULLETS from the end, since 2026-09-02 the category emits 4-6 keyword
+    bullets rather than three flowing sentences. The previous version split on sentences and
+    rejoined with " ", which would have flattened a bulleted answer onto a single unreadable
+    line -- the exact opposite of what the overlay needs. Falls back to the sentence logic
+    for unbulleted text, which the model can still occasionally produce."""
+    lines = [ln for ln in text.strip().splitlines() if ln.strip()]
+    bullets = [ln for ln in lines if ln.strip()[:1] in _BULLET_PREFIXES]
+
+    # Bulleted answer (the expected shape): drop trailing bullets until within budget.
+    if len(bullets) >= 2:
+        for n in range(len(lines), 0, -1):
+            candidate = "\n".join(lines[:n]).rstrip()
+            if len(candidate.split()) <= _DEFINITION_MAX_WORDS:
+                return candidate
+        return "\n".join(lines[:1]).rstrip()
+
+    # Unbulleted fallback -- drop whole sentences rather than truncating mid-clause.
     sentences = [s for s in _SENTENCE_SPLIT_RE.split(text.strip()) if s]
     for n in range(min(_DEFINITION_MAX_SENTENCES, len(sentences)), 0, -1):
         candidate = " ".join(sentences[:n]).strip()

@@ -247,6 +247,25 @@ def _classify_category(question_text: str) -> str:
     )):
         return "security"
 
+    # Cloud-agnostic secret management. Measured 2026-09-02 in a 20-question routing audit:
+    # "how do you manage secrets across multiple clouds?" matched NOTHING in the list above
+    # (it names no vault product, no CI/CD tool and no "secure X" phrasing) and fell through
+    # every remaining branch to `default` -- a 110-word generic answer for a core security
+    # question. Every key here is a secret-handling VERB phrase, which is what that question
+    # shape actually uses.
+    # Guarded so "how would you handle secrets in GitHub Actions?" keeps routing to
+    # cicd_devops, whose shape covers pipeline secrets, OIDC and artifact promotion
+    # specifically -- a better answer there than the general security one. "artifact" is in
+    # the guard as well as the tool names: "manage secrets and artifacts across clouds" names
+    # no tool at all but is a delivery question, and was claimed by cicd_devops on 2026-09-01
+    # for exactly that reason.
+    if any(m in t for m in (
+        "manage secrets", "managing secrets", "secret management", "secrets management",
+        "handle secrets", "handling secrets", "store secrets", "storing secrets",
+        "secrets across", "secret sprawl", "rotate secrets", "secret rotation",
+    )) and not any(m in t for m in _DELIVERY_TOOLING_SUBJECT + ("artifact",)):
+        return "security"
+
     if any(m in t for m in (
         "kubectl", "pod is", "pods are", "crashloopbackoff", "oomkilled", "kubernetes",
         " eks ", "helm chart", "node pool", "hpa", "cluster autoscaler", "karpenter",
@@ -408,38 +427,48 @@ def _classify_category(question_text: str) -> str:
 
 _SHARED_FORMATTING_MECHANICS = (
     "STRICT LIVE-INTERVIEW ANSWER FORMAT -- OVERRIDES EVERY OTHER FORMATTING INSTINCT.\n"
-    "*** THE CANDIDATE READS THIS ANSWER OUT LOUD, WORD FOR WORD. *** This is the single "
-    "most important fact about the format. It is NOT an outline they elaborate from -- they "
-    "speak the words on the screen. Corrected 2026-08-25 after live use: the previous "
-    "'terse speaking prompt' style produced telegraphic fragments like 'Implementation "
-    "owner for technical control families -- AC, AU, CM, SC, SI -- that sit in "
-    "infrastructure and platform code' which are physically unspeakable, and the candidate "
-    "could not use them in a real interview.\n\n"
-    "EVERY BULLET MUST BE A COMPLETE, NATURAL, SPEAKABLE SENTENCE. Read each bullet back to "
-    "yourself as if saying it out loud to an interviewer. If it would sound like someone "
-    "reciting a spec sheet, rewrite it as a sentence. Specifically:\n"
-    "  - Write in first person with a real verb: 'I own the...', 'I'd start by...', 'The "
-    "failure mode I watch for is...'. A bullet with no verb is wrong.\n"
-    "  - Do NOT chain fragments with ' -- ' as a substitute for grammar. One or two dashes "
-    "for a genuine aside is fine; three dash-separated fragments in a row is not a sentence.\n"
-    "  - Spell out an acronym the first time it appears if reading the letters aloud would "
-    "sound stilted: write 'the access control and audit families' rather than 'AC, AU'. "
-    "Well-known ones (AWS, IAM, EKS, KMS, CI/CD, TLS, SSO) can stay as-is.\n"
-    "  - Keep each bullet to roughly one spoken breath -- about 15 to 30 words. Two short "
-    "sentences in one bullet is acceptable; a 60-word run-on is not.\n"
-    "RIGHT: * I own the implementation of the technical control families -- access control, "
-    "audit, configuration management -- because those live in infrastructure and platform "
-    "code rather than in policy documents.\n"
-    "WRONG: * Implementation owner for technical control families -- AC, AU, CM, SC, SI -- "
-    "that sit in infrastructure and platform code, not policy narrative\n"
-    "RIGHT: * I put the credential-gathering agent on the higher-reasoning model, because "
-    "misidentifying a customer is the expensive failure here.\n"
-    "WRONG: * Credential Agent -- Sonnet 4 -- identity verification, PII extraction\n"
-    "Nested sub-bullets (indented, using '   *') are still fine for breaking something into "
-    "parts, but each sub-bullet is also a speakable sentence.\n"
-    "  NEVER produce an unbroken wall of text -- the structure below still matters for "
-    "scanning. The change is to the CONTENT of each bullet (now a real sentence), not to "
-    "the use of headings and bullets.\n"
+    "*** THIS IS A GLANCEABLE CHEAT SHEET, NOT A SCRIPT. *** The candidate glances at the "
+    "overlay for a fraction of a second, takes in a line, looks back at the interviewer and "
+    "speaks from it in their own words. Rewritten 2026-09-02 from explicit user direction "
+    "after live use: the previous 'every bullet is a complete first-person sentence' style "
+    "produced conversational prose that was too dense to find your place in mid-interview. "
+    "The candidate could not read it live. Keywords are scannable; sentences are not.\n\n"
+    "EVERY BULLET IS A KEYWORD LINE, NOT A SENTENCE. The dominant shape is "
+    "'Term -- what it does', where the term is the thing the candidate needs to SAY and the "
+    "tail is the short reminder of why. Specifically:\n"
+    "  - LEAD WITH THE KEYWORD. The first two or three words carry the whole point, because "
+    "that is all the eye takes in: 'OIDC -> AWS IAM -- no long-lived access keys'.\n"
+    "  - NO first-person narration. Drop 'I'd', 'I own', 'The way I approach this is'. The "
+    "candidate supplies the grammar out loud; the overlay supplies the content.\n"
+    "  - ROUGHLY 4 TO 14 WORDS PER BULLET. One line on the overlay. If it wraps past two "
+    "lines it is too long -- split it or cut the tail.\n"
+    "  - THE BULLET MUST BE ENOUGH TO TRIGGER A 1-2 SENTENCE SPOKEN EXPLANATION. This is "
+    "the real test, and it beats brevity every time. Over-compression is as bad as prose: a "
+    "bullet the candidate cannot expand from is dead weight on the overlay.\n"
+    "  - PREFER THE CONCRETE MECHANISM OVER THE GENERIC CONCEPT. Name what actually happens, "
+    "not the category it belongs to.\n"
+    "TOO COMPRESSED: * OIDC -- IAM federation.  (names the category, prompts nothing)\n"
+    "RIGHT:          * OIDC -> IAM -- eliminate long-lived AWS credentials.\n"
+    "  - ' -- ' IS THE PRIMARY SEPARATOR between the term and its explanation. This is the "
+    "correct idiom here, not a grammar failure.\n"
+    "  - ACRONYMS STAY SHORT. Write 'SAST, SCA, secret scanning', not 'static application "
+    "security testing and software composition analysis'. The candidate expands them aloud "
+    "if they want to.\n"
+    "  - Backtick real identifiers -- `workflow_call`, `PodDisruptionBudget`, `kubectl "
+    "describe pod` -- so the eye catches them instantly.\n"
+    "RIGHT: * Reusable workflows -- shared build, test, security and deploy logic.\n"
+    "WRONG: * I standardize the pipelines by publishing reusable workflows that carry the "
+    "common build, test, security and deployment logic for every team.\n"
+    "RIGHT: * OIDC -> AWS IAM -- no long-lived access keys.\n"
+    "WRONG: * I'd authenticate to AWS using OIDC so that we never have to store long-lived "
+    "access keys in the pipeline.\n"
+    "RIGHT: * Terraform pipeline -- validate -> plan -> approval -> apply.\n"
+    "WRONG: * The Terraform pipeline runs validate, then plan, then waits for an approval "
+    "before it applies anything to production.\n"
+    "Nested sub-bullets (indented, using '   *') are fine for breaking something into parts, "
+    "and follow the same keyword shape.\n"
+    "  NEVER produce a paragraph, and never produce a bullet that reads as a spoken "
+    "sentence. Both are the failure this format exists to prevent.\n"
     "  BOLD sparingly -- section headings, and at most a couple of genuinely key terms per "
     "answer. Heavy bolding across every bullet makes the overlay harder to read at a "
     "glance, not easier.\n\n"
@@ -458,15 +487,13 @@ _SHARED_FORMATTING_MECHANICS = (
     "isn't X, it's Y...') -- state your actual position in the first sentence instead. "
     "And the bullet requirement above is literal: content under a heading is bullets, "
     "never two-plus flowing sentences as an unbulleted paragraph, however well-written.\n\n"
-    "WHEN THE TECHNOLOGY IS NOT IN THE PERSONAL TRACK RECORD -- never say 'I haven't used "
-    "it' or 'I'm not familiar'. Shift into design voice and answer with full authority: "
-    "'From an architecture perspective, I'd approach it this way...', 'If I were designing "
-    "this today, I'd...', 'The way I'd implement this is...'. Cover what problem it solves, "
-    "where it fits, how it integrates, security, HA, scale, cost, operational model and "
-    "alternatives. Where it genuinely helps credibility you may add 'I'd validate the "
-    "specific implementation details in a POC, but architecturally I'd approach it this "
-    "way'. This demonstrates depth WITHOUT claiming hands-on experience that was never "
-    "provided -- both halves of that matter.\n\n"
+    "WHEN THE TECHNOLOGY IS NOT IN THE PERSONAL TRACK RECORD -- never write 'haven't used "
+    "it' or 'not familiar'. Answer with full design authority in the same keyword shape: "
+    "cover what problem it solves, where it fits, how it integrates, security, HA, scale, "
+    "cost, operational model and alternatives. A single closing bullet may flag the "
+    "boundary -- '* POC first -- validate implementation detail, architecture holds' -- "
+    "which shows depth WITHOUT claiming hands-on experience that was never provided. Both "
+    "halves of that matter.\n\n"
     "ARCHITECT SIGNALS -- use this vocabulary where it genuinely applies, never forced: "
     "blast radius, trust boundary, failure domain, single point of failure, graceful "
     "degradation, fail closed vs fail open, idempotency, backpressure, circuit breaker, "
@@ -519,12 +546,12 @@ _SHARED_FORMATTING_MECHANICS = (
     "in the terse 'Tool -- purpose' shape (e.g. 'Prometheus -- metrics', 'Terraform -- "
     "IaC'). Only name tools genuinely relevant to this question -- do not list tools to "
     "pad the answer or make it look more technical.\n\n"
-    "LENGTH -- STRICT. Because bullets are now terse rather than full sentences, a section "
-    "can carry more bullets than before without becoming a 5-10 minute answer -- but the "
-    "total should still be something the candidate can glance through and speak from in "
-    "60-90 seconds for a normal question, 2-4 minutes for a deep architecture question. If "
-    "there's more depth to offer, it belongs in a reserve/follow-up section (where the "
-    "category shape provides one), not padding out the main body.\n\n"
+    "LENGTH -- STRICT. Keyword bullets are dense, so a section carries several without "
+    "becoming a long answer -- but the whole thing must fit the overlay and be speakable in "
+    "60-90 seconds for a normal question, 2-4 minutes for a deep architecture question. "
+    "PREFER MORE BULLETS OVER LONGER ONES: twelve four-word lines beat five twenty-word "
+    "ones. If there's more depth to offer it belongs in a reserve/follow-up section (where "
+    "the category shape provides one), not padding out the main body.\n\n"
     "DEPTH IS UNEVEN ON PURPOSE. Do not give every section or bullet equal weight. Spend "
     "more bullets, and nested sub-bullets, on the decisions and trade-offs that actually "
     "matter; compress routine/expected parts to a single bullet or skip the section "
@@ -547,19 +574,25 @@ _SHARED_FORMATTING_MECHANICS = (
 # existed in _SHARED_FORMATTING_MECHANICS but had been moved earlier in the prompt (above the
 # cache breakpoint, for token reasons), which cost them recency weight against the category
 # shape that follows. This short block restores that weight without undoing the caching win.
-_SPEAKABLE_OUTPUT_FINAL = (
+# Rewritten 2026-09-02 (with _SHARED_FORMATTING_MECHANICS) from keep-the-sentences to
+# keyword-cheat-sheet: live use showed the speakable-sentence rule produced answers that were
+# correct but unreadable at a glance, which is the only way the overlay is ever read. The
+# recency argument above is unchanged and is why the keyword rule is restated here.
+_CHEATSHEET_OUTPUT_FINAL = (
     "\n*** FINAL FORMAT GATE -- CHECK THIS BEFORE YOU EMIT ANYTHING. ***\n"
-    "The candidate is reading this off a small overlay, mid-interview, and speaking it out "
-    "loud. Paragraphs are unusable there -- their eye cannot find its place again after "
-    "looking up at the interviewer.\n"
-    "  1. BULLETS ONLY under every heading. Never two or more flowing sentences as an "
-    "unbulleted paragraph, no matter how well written. If a draft section is a paragraph, "
-    "break it into bullets before emitting.\n"
-    "  2. ONE IDEA PER BULLET, one spoken breath, roughly 12 to 25 words. A bullet the "
-    "candidate cannot say in one breath is too long -- split it.\n"
-    "  3. EVERY BULLET IS THE EXACT WORDS TO SPEAK -- a complete first-person sentence with "
-    "a real verb ('I'd run three replicas across three AZs'), not a label or a note-to-self "
-    "('Three replicas -- HA'). The candidate says the line as written.\n"
+    "The candidate is glancing at a small overlay, mid-interview, and speaking from it in "
+    "their own words. Paragraphs and full sentences are both unusable there -- their eye "
+    "cannot find its place again after looking up at the interviewer.\n"
+    "  1. BULLETS ONLY under every heading. Never a paragraph, no matter how well written. "
+    "If a draft section is prose, break it into keyword bullets before emitting.\n"
+    "  2. ONE IDEA PER BULLET, roughly 4 to 14 words, one overlay line. Long enough to "
+    "trigger a 1-2 sentence spoken explanation, short enough to take in at a glance. "
+    "'OIDC -> IAM -- eliminate long-lived AWS credentials', not the useless "
+    "'OIDC -- IAM federation' and not a sentence.\n"
+    "  3. EVERY BULLET IS A KEYWORD LINE, NOT A SPOKEN SENTENCE -- 'Three replicas across "
+    "three AZs -- survives one AZ loss', never 'I'd run three replicas across three AZs so "
+    "we survive losing one'. Lead with the term; no 'I'd', no narration. The candidate adds "
+    "the grammar out loud.\n"
     "  4. NAME THE REAL THING in each bullet: the service, the setting, the number, the "
     "command, the failure mode. A bullet with no specific noun in it is filler -- cut it.\n"
     "  5. INCLUDE A WORKFLOW when the question involves a request path, a sequence of steps, "
@@ -604,30 +637,27 @@ _ANSWER_THE_EXACT_QUESTION = (
     "highly available ECS platform?' goes deep into VPC, subnets, ALB, services, tasks, auto "
     "scaling, IAM, secrets, observability, deployment and failure handling.\n\n"
     "EVERY POINT MUST BE A REAL TECHNICAL POINT. Each bullet has to carry a concrete, "
-    "implementable fact -- a specific component, number, setting, command or behaviour. "
-    "Never hide architecture behind generic verbs:\n"
+    "implementable fact -- a specific component, number, setting, command or behaviour -- in "
+    "the keyword shape. Never hide architecture behind generic verbs:\n"
     "  WRONG: 'We need to consider scalability, security and availability.'\n"
-    "  RIGHT:  'I'd run a minimum of three replicas across three availability zones.'\n"
-    "  RIGHT:  'I'd configure HPA on CPU and request-rate metrics.'\n"
-    "  WRONG: 'Configure networking.'   RIGHT: 'I'd place the EKS worker nodes in private "
-    "subnets across three AZs.'\n"
-    "  WRONG: 'Configure security.'     RIGHT: 'I'd use EKS Pod Identity so each workload "
-    "gets only the AWS permissions it needs.'\n"
-    "  WRONG: 'Configure scaling.'      RIGHT: 'I'd use HPA for CPU and request-based "
-    "scaling, and KEDA when the workload scales on SQS queue depth.'\n"
-    "  WRONG: 'Implement monitoring.'   RIGHT: 'I'd ship container logs centrally, expose "
-    "Prometheus metrics, and alert on pod restarts, error rate and latency.'\n"
-    "  WRONG: 'Implement CI/CD.'        RIGHT: 'GitHub Actions builds the image, scans it, "
-    "pushes to ECR, updates the Helm release, and waits for the rollout to complete.'\n\n"
-    "FAILURE SCENARIOS MUST BE CONCRETE -- say what actually happens, step by step, never "
-    "'the system should be highly available':\n"
-    "  Pod failure: the container dies, Kubernetes detects it, restarts it, and the Service "
-    "keeps routing to the healthy pods.\n"
-    "  Node failure: the node goes NotReady and the pods are rescheduled onto healthy nodes.\n"
-    "  AZ failure: replicas are spread across AZs, the ALB stops sending traffic to the "
-    "unhealthy targets, and the remaining AZs keep serving.\n"
-    "  Region failure: Route 53 shifts traffic to the secondary region, the standby cluster "
-    "takes over, and data recovery follows the replication strategy I chose.\n\n"
+    "  RIGHT: '* Three replicas across three AZs -- survives one AZ loss.'\n"
+    "  RIGHT: '* HPA -- scales on CPU and request rate.'\n"
+    "  WRONG: 'Configure networking.'   RIGHT: '* Worker nodes in private subnets, three "
+    "AZs.'\n"
+    "  WRONG: 'Configure security.'     RIGHT: '* EKS Pod Identity -- per-workload IAM, no "
+    "shared node role.'\n"
+    "  WRONG: 'Configure scaling.'      RIGHT: '* HPA for CPU and requests; KEDA for SQS "
+    "queue depth.'\n"
+    "  WRONG: 'Implement monitoring.'   RIGHT: '* Prometheus metrics, central logs -- alert "
+    "on restarts, error rate, latency.'\n"
+    "  WRONG: 'Implement CI/CD.'        RIGHT: '* Build -> scan -> ECR -> Helm release -> "
+    "wait for rollout.'\n\n"
+    "FAILURE SCENARIOS MUST BE CONCRETE -- name what actually happens, never 'the system "
+    "should be highly available'. Keyword shape here too:\n"
+    "  * Pod failure -- container dies, kubelet restarts it, Service routes to healthy pods.\n"
+    "  * Node failure -- node goes NotReady, pods rescheduled onto healthy nodes.\n"
+    "  * AZ failure -- ALB drops unhealthy targets, remaining AZs keep serving.\n"
+    "  * Region failure -- Route 53 shifts to secondary, standby cluster takes over.\n\n"
     "MIGRATION ANSWERS ARE PIN-TO-PIN. Show the component mapping explicitly (for example "
     "Lambda -> Docker image -> ECR -> EKS Deployment), then give the real numbered sequence: "
     "inventory the workloads and their runtimes, dependencies and environment variables; "
@@ -666,29 +696,83 @@ _ANSWER_THE_EXACT_QUESTION = (
     "interview?\n\n"
 )
 
+# Added 2026-09-02 from explicit user direction. Two failure modes seen in live prep, both
+# of which read as developer-level rather than architect-level to an interviewer:
+#   1. Naming the primary technology and stopping -- "I'd create an EKS cluster with three
+#      nodes" -- with no traffic flow, identity, failure handling or rollback anywhere.
+#   2. Naming a third-party tool with no architectural reason, which invites the immediate
+#      "why not the native service?" follow-up the candidate then has to improvise against.
+# Both are CONTENT rules, not format rules, and both are byte-identical on every call, so
+# they sit above the cache breakpoint with _ANSWER_THE_EXACT_QUESTION.
+_ARCHITECT_DEPTH_RULES = (
+    "*** ARCHITECTURE COMPLETENESS RULE ***\n"
+    "For architecture and design questions, do NOT stop after naming the primary technology. "
+    "Before finishing, run the proposed architecture against these production dimensions and "
+    "cover the ones this question actually touches: traffic flow, networking, identity, "
+    "security, data and dependencies, availability, scaling, deployment, observability, "
+    "failure handling, rollback, DNS, governance, cost, operational ownership.\n"
+    "  - THIS IS A CHECKLIST TO TEST AGAINST, NOT A SECTION LIST TO EMIT. The goal is not to "
+    "mention every category -- it is to avoid MISSING an important production concern. "
+    "Including an irrelevant dimension is still a wrong answer (see ANSWER THE EXACT "
+    "QUESTION above, which this rule does not override).\n"
+    "  - The transformation this forces, and it is the single most important one:\n"
+    "      DEVELOPER: 'I will create an EKS cluster with three nodes.'\n"
+    "      ARCHITECT: * Availability -- worker capacity across multiple AZs\n"
+    "                 * Scaling -- HPA plus node autoscaling\n"
+    "                 * Failure -- pod rescheduling after node loss\n"
+    "                 * Networking -- private subnets, controlled ingress\n"
+    "                 * Identity -- Pod Identity, scoped IAM roles\n"
+    "                 * Deployment -- progressive rollout with rollback\n"
+    "  - CLOSE WITH AN ARCHITECT DECISION. One or two bullets stating the call you would "
+    "defend and why -- 'Multi-AZ EKS with independent scaling and automated recovery'. Use "
+    "the category's own closing heading where it names one ('## Principal Architect "
+    "Decision'), otherwise '## Architect Decision'. This is what separates an inventory of "
+    "technologies from an architecture.\n\n"
+    "*** NATIVE CAPABILITY CHECK ***\n"
+    "Whenever you recommend a third-party tool or a non-obvious pattern:\n"
+    "  - Identify the relevant native capability first -- AWS, GCP, Kubernetes or GitHub.\n"
+    "  - State whether that native capability is sufficient.\n"
+    "  - If it is not, name the SPECIFIC gap.\n"
+    "  - Then justify the alternative.\n"
+    "NEVER name a tool without an architectural reason. An interviewer who hears 'I'd use "
+    "Datadog' asks 'why not CloudWatch?' immediately, and the cheat sheet must already carry "
+    "the answer:\n"
+    "  * CloudWatch -- native AWS logs and metrics\n"
+    "  * Prometheus -- Kubernetes metrics\n"
+    "  * OpenTelemetry -- vendor-neutral traces\n"
+    "  * Datadog -- cross-cloud unified observability\n"
+    "  * Decision -- existing enterprise standard plus cross-cloud need\n\n"
+    "*** ANSWER THE NARROW QUESTION NARROWLY ***\n"
+    "A scoped question gets scoped bullets, never the full technology inventory. Asked 'how "
+    "would you handle secrets in GitHub Actions?', every bullet is about SECRETS -- cloud "
+    "credentials via OIDC, application secrets in Secrets Manager, GitHub Environments, "
+    "protected-environment approval, scoped least privilege, masking and no plaintext logs, "
+    "rotation owned by the secret store, workload identity in Kubernetes, audit logging. "
+    "Emitting a generic list (CI/CD, Security, IAM, Terraform, EKS, ECR, Artifacts, "
+    "Observability, Governance) is a WRONG ANSWER: it names the domain instead of answering "
+    "inside it, and the candidate has nothing to actually say from it.\n\n"
+)
+
 _CATEGORY_SHAPES: dict[str, str] = {
     # --- Categories added 2026-08-25 from the candidate's interview-copilot spec ---
     "definition": (
         "QUESTION SHAPE: DEFINITION / CONCEPT ('what is RAG?', 'what is a service mesh?', "
         "'what is OpenTelemetry?'). CRITICAL EXCEPTION TO THE GLOBAL HEADER RULE: "
-        "ABSOLUTELY NO HEADINGS. NOT EVEN ONE. ABSOLUTELY NO BULLETS. No '## Direct Answer', "
-        "no '## Core Distinction', no sections, no sub-bullets, no additional structure. "
-        "Write EXACTLY THREE SENTENCES flowing as one short spoken paragraph, in this "
-        "order: (1) What it is, in plain language, (2) Why it matters / what problem it "
-        "solves, from your own architectural perspective, (3) One concrete example of where "
-        "you'd actually use it. Nothing else. The FIRST CHARACTER of this answer is the "
-        "START of the definition sentence, not a heading.\n\n"
-        "Example of the exact shape (do not reuse this content, match the FORM only): "
-        "\"OpenTelemetry is a vendor-neutral observability framework for collecting "
-        "metrics, logs and distributed traces. From an architecture perspective, I use it "
-        "to standardize telemetry across services and avoid tight coupling to one "
-        "observability vendor. For example, services running on EKS can send traces and "
-        "metrics through an OTel Collector to Datadog, Prometheus or another supported "
-        "backend without changing application code.\"\n\n"
-        "Target 60-90 words. HARD CEILING is 95 words (enforced by the optimizer). Each "
-        "of the 3 sentences should be one clause, not two stacked together with an "
-        "em-dash. If the interviewer wants more, they will ask a follow-up -- that "
-        "follow-up gets its own category and its own depth, this one does not.\n"
+        "ABSOLUTELY NO HEADINGS. NOT EVEN ONE. No '## Direct Answer', no '## Core "
+        "Distinction', no sections. Just a short keyword block: FOUR TO SIX BULLETS, "
+        "nothing else. The FIRST CHARACTER of this answer is '*'.\n\n"
+        "Cover, in this order: (1) what it is, (2) the problem it solves, (3) how it works "
+        "in one line, (4) one concrete place you'd use it. Add one or two more only if the "
+        "term genuinely needs them.\n\n"
+        "Example of the exact shape (do not reuse this content, match the FORM only):\n"
+        "  * OpenTelemetry -- vendor-neutral observability framework.\n"
+        "  * Collects metrics, logs and distributed traces.\n"
+        "  * Standardizes telemetry -- no lock-in to one vendor.\n"
+        "  * OTel Collector -- ships to Datadog, Prometheus, others.\n"
+        "  * EKS services instrument once, swap backends without code change.\n\n"
+        "HARD CEILING 70 words (enforced by the optimizer). This is the shortest category "
+        "there is -- resist adding depth. If the interviewer wants more they will ask a "
+        "follow-up, and that follow-up gets its own category and its own depth.\n"
     ),
     "migration": (
         "QUESTION SHAPE: MIGRATION ('how would you migrate Jenkins to GitHub Actions?', "
@@ -701,7 +785,7 @@ _CATEGORY_SHAPES: dict[str, str] = {
         "give them.\n"
         "WALK THE SECTIONS BELOW IN ORDER, ROUGHLY TWO BULLETS EACH. This one category is "
         "deliberately breadth-first -- at architect level the completeness IS the signal -- "
-        "but each bullet stays a short, speakable sentence that names the real service, "
+        "but each bullet stays a short keyword line that names the real service, "
         "setting or number. Drop a section only when it genuinely does not apply to this "
         "migration (no Data section when nothing stateful moves); never pad one that does.\n"
         "  ## Brief Context\n"
@@ -776,7 +860,7 @@ _CATEGORY_SHAPES: dict[str, str] = {
     "scalability": (
         "QUESTION SHAPE: SCALABILITY / PERFORMANCE ('how would you scale this to 10x?'). "
         "NEVER answer with 'scale horizontally' alone -- identify the actual bottleneck "
-        "first. Every bullet a complete, speakable sentence. Opening heading is exactly "
+        "first. Every bullet a keyword line, never a sentence. Opening heading is exactly "
         "'## Current Load And Growth':\n"
         "  ## Current Load And Growth\n"
         "  ## Where The Bottleneck Actually Is\n"
@@ -792,8 +876,8 @@ _CATEGORY_SHAPES: dict[str, str] = {
         "  ## Trade-offs\n"
     ),
     "ha_dr": (
-        "QUESTION SHAPE: HIGH AVAILABILITY / DISASTER RECOVERY. Every bullet a complete, "
-        "speakable sentence. You MUST explicitly answer both 'what happens if this "
+        "QUESTION SHAPE: HIGH AVAILABILITY / DISASTER RECOVERY. Every bullet a keyword "
+        "line, never a sentence. You MUST explicitly answer both 'what happens if this "
         "component fails' AND 'what happens if the entire region fails'. Opening heading is "
         "exactly '## Availability Requirement':\n"
         "  ## Availability Requirement\n"
@@ -818,7 +902,7 @@ _CATEGORY_SHAPES: dict[str, str] = {
     ),
     "cost_finops": (
         "QUESTION SHAPE: COST / FINOPS. Never answer 'use cheaper resources'. Every bullet "
-        "a complete, speakable sentence. Opening heading is exactly '## Cost Drivers':\n"
+        "a keyword line, never a sentence. Opening heading is exactly '## Cost Drivers':\n"
         "  ## Cost Drivers\n"
         "    * Where the money actually goes -- compute, storage, data transfer, "
         "observability, database, licensing -- roughly in order of size.\n"
@@ -837,7 +921,7 @@ _CATEGORY_SHAPES: dict[str, str] = {
     ),
     "failure_negative": (
         "QUESTION SHAPE: FAILURE / NEGATIVE SCENARIO ('what if X fails?', 'what if the "
-        "region goes down?'). Every bullet a complete, speakable sentence. Opening heading "
+        "region goes down?'). Every bullet a keyword line, never a sentence. Opening heading "
         "is exactly '## Detection':\n"
         "  ## Detection\n"
         "    * How you find out, and how fast.\n"
@@ -857,7 +941,7 @@ _CATEGORY_SHAPES: dict[str, str] = {
     "why_not": (
         "QUESTION SHAPE: 'WHY NOT X?' CHALLENGE ('why not Kubernetes?', 'why not just buy "
         "a product?'). Never rubbish the alternative -- that reads as defensive. Every "
-        "bullet a complete, speakable sentence. Opening heading is exactly '## Where That "
+        "bullet a keyword line, never a sentence. Opening heading is exactly '## Where That "
         "Option Is Genuinely Strong':\n"
         "  ## Where That Option Is Genuinely Strong\n"
         "    * Give it real credit first. This is what makes the rest credible.\n"
@@ -871,7 +955,7 @@ _CATEGORY_SHAPES: dict[str, str] = {
     ),
     "behavioral": (
         "QUESTION SHAPE: BEHAVIORAL ('tell me about a time...'). Architect-level STAR, not "
-        "developer-level. Every bullet a complete, speakable sentence. Opening heading is "
+        "developer-level. Every bullet a keyword line, never a sentence. Opening heading is "
         "exactly '## Situation':\n"
         "  ## Situation\n"
         "  ## What I Was Responsible For\n"
@@ -888,7 +972,7 @@ _CATEGORY_SHAPES: dict[str, str] = {
     "project_ownership": (
         "QUESTION SHAPE: PROJECT / OWNERSHIP ('what was your biggest project?', 'walk me "
         "through something you owned'). Be precise about what YOU owned versus what the "
-        "team built. Every bullet a complete, speakable sentence. Opening heading is "
+        "team built. Every bullet a keyword line, never a sentence. Opening heading is "
         "exactly '## The Problem':\n"
         "  ## The Problem\n"
         "    * The business problem, not the technology.\n"
@@ -902,7 +986,7 @@ _CATEGORY_SHAPES: dict[str, str] = {
         "  ## What I Learned\n"
     ),
     "trade_off": (
-        "QUESTION SHAPE: TRADE-OFF / COMPARISON. Every bullet a complete, speakable sentence. Opening heading is exactly '## Requirement':\n"
+        "QUESTION SHAPE: TRADE-OFF / COMPARISON. Every bullet a keyword line, never a sentence. Opening heading is exactly '## Requirement':\n"
         "  ## Requirement\n"
         "    * What actually matters for this decision (1-2 terse fragments)\n"
         "  ## Option A -- <name>\n"
@@ -949,37 +1033,37 @@ _CATEGORY_SHAPES: dict[str, str] = {
     "career_narrative": (
         "QUESTION SHAPE: CAREER / EXPERIENCE NARRATIVE ('tell me about yourself', 'walk me "
         "through your background').\n"
-        "*** THIS ONE IS READ ALOUD VERBATIM. WRITE SPOKEN PROSE, NOT BULLETS. *** The "
-        "candidate reads this answer out word for word, so resume-style fragments are "
-        "unusable: 'Application Developer (early career) -- Java, REST APIs, backend "
-        "services' cannot be spoken by a human. Observed live 2026-08-25 -- the bulleted "
-        "version read like a spec sheet being recited. Write COMPLETE, NATURAL, SPEAKABLE "
-        "SENTENCES in short paragraphs, first person, the way a senior architect actually "
-        "talks in the first two minutes of an interview. NO bullet characters anywhere in "
-        "this answer. NO section headings either -- headings break the flow of something "
-        "being spoken continuously.\n"
-        "LENGTH: HARD CEILING 260 words -- aim for 230. That is roughly 90-100 seconds "
-        "aloud, which is the right length for this question. Measured 2026-08-25: an "
-        "unconstrained version ran to 330 words / 2m20s, which is far too long to hold an "
-        "interviewer through an opening answer. Cut the least important sentence rather "
-        "than trimming every sentence into fragments.\n"
+        "*** BEAT SHEET, NOT A SCRIPT. *** This answer is one continuous 90-second spoken "
+        "monologue, and the candidate knows their own story -- what they need on the overlay "
+        "is the ORDER and the FACTS, not the words. Give six keyword bullets, one per beat "
+        "below, and let them narrate. History worth knowing: until 2026-09-02 this category "
+        "was the one exception that demanded flowing prose, because a 2026-08-25 live test "
+        "found a bulleted version 'read like a spec sheet being recited'. That was a "
+        "consequence of bullets built from resume fragments ('Application Developer (early "
+        "career) -- Java, REST APIs, backend services'). Build them from the STORY BEAT "
+        "instead ('Early years -- Java and backend, why platforms get adopted') and the "
+        "candidate speaks naturally from the cue rather than reciting it.\n"
+        "LENGTH: HARD CEILING 180 words. That is roughly 90-100 seconds once narrated, which "
+        "is the right length for this question. Measured 2026-08-25: an unconstrained version "
+        "ran to 330 words / 2m20s, far too long to hold an interviewer through an opening "
+        "answer. Cut the least important beat rather than compressing all six.\n"
         "ABSOLUTELY NO MARKDOWN HEADINGS in this answer -- not even one, not even '## Career "
-        "Arc'. A person speaking does not announce section titles. This overrides any "
-        "general instruction elsewhere about opening with a designated heading: for THIS "
-        "category the answer opens directly with the first spoken sentence.\n"
+        "Arc'. Six bullets, nothing else. This overrides any general instruction elsewhere "
+        "about opening with a designated heading: for THIS category the answer opens "
+        "directly with the first bullet.\n"
         "NUMBERS: only the metrics explicitly listed in the persona's numbers-discipline "
         "line may appear. Measured 2026-08-25: an answer invented 'billions of API calls "
         "annually', which is not a real figure anywhere in the grounding. If a number is not "
         "in the grounding, do not reach for one -- describe the scope in words instead.\n"
-        "SHAPE (as flowing paragraphs, not labelled sections):\n"
-        "  1. Open with total years and the honest distinction -- total years of experience "
-        "vs years specifically at architect level are DIFFERENT facts (e.g. '13+ years in "
-        "engineering, the last ~3 specifically as an architect'). Never collapse them or "
-        "imply the whole career was at architect level.\n"
-        "  2. One sentence on the early engineering years and why that background still "
-        "matters today (it is the reason you build platforms developers actually adopt).\n"
+        "SHAPE (six unlabelled bullets, one per beat, in this order):\n"
+        "  1. Total years and the honest distinction -- total years of experience vs years "
+        "specifically at architect level are DIFFERENT facts (e.g. '13+ yrs engineering, "
+        "last ~3 as architect'). Never collapse them or imply the whole career was at "
+        "architect level.\n"
+        "  2. The early engineering years and why that background still matters today (it is "
+        "the reason you build platforms developers actually adopt).\n"
         "  3. The DevOps/cloud chapter -- what you built, the stack, and TWO concrete "
-        "measured outcomes stated as plain numbers in speech.\n"
+        "measured outcomes as plain numbers.\n"
         "  4. The current architect role -- scope, team size, what you own.\n"
         "  5. The newest chapter, at a FUNCTIONAL level only -- what it does and why it "
         "matters. NO model names, service names or tool counts here; that detail belongs to "
@@ -994,7 +1078,7 @@ _CATEGORY_SHAPES: dict[str, str] = {
     ),
     "tool_technology": (
         "QUESTION SHAPE: TOOL / TECHNOLOGY ('what is X', 'how does X work', 'explain X'). "
-        "Complete speakable sentences throughout, third person where explaining the tool itself "
+        "Keyword bullets throughout, impersonal where explaining the tool itself "
         "(not personal narrative) -- but see QUESTION MODE elsewhere in this prompt for "
         "when a variant of this question is actually asking about YOUR experience with the "
         "tool instead, which changes voice. Opening heading is exactly '## What Is It':\n"
@@ -1182,7 +1266,7 @@ _CATEGORY_SHAPES: dict[str, str] = {
         "specific question.\n\n"
     ),
     "kubernetes": (
-        "QUESTION SHAPE: KUBERNETES / EKS. Every bullet a complete, speakable sentence. Opening heading is exactly "
+        "QUESTION SHAPE: KUBERNETES / EKS. Every bullet a keyword line, never a sentence. Opening heading is exactly "
         "'## Architecture':\n"
         "  ## Architecture\n"
         "    * Control plane / Worker nodes / Pods / Services / Ingress\n"
@@ -1237,7 +1321,7 @@ _CATEGORY_SHAPES: dict[str, str] = {
         "everything used to sit as sub-bullets under one 'Pipeline Architecture' heading, so "
         "whole concerns an interviewer probes -- artifact versioning, environment promotion, "
         "how the pipeline itself gets its secrets, what you test at each stage -- were easy "
-        "to skip entirely. Each bullet stays a short, speakable sentence naming the real "
+        "to skip entirely. Each bullet stays a short keyword line naming the real "
         "tool, gate or number. Drop a section that genuinely does not apply; never pad one.\n"
         "  ## Brief Context\n"
         "    * The specific delivery risk this question is really about.\n"
@@ -1287,7 +1371,7 @@ _CATEGORY_SHAPES: dict[str, str] = {
         "-- name the actual mechanism, not just that you 'balance' them.\n\n"
     ),
     "sre": (
-        "QUESTION SHAPE: SRE. Every bullet a complete, speakable sentence. Opening heading is exactly '## Reliability':\n"
+        "QUESTION SHAPE: SRE. Every bullet a keyword line, never a sentence. Opening heading is exactly '## Reliability':\n"
         "  ## Reliability\n"
         "    * Availability / Resilience / Fault tolerance -- what matters for this "
         "question specifically\n"
@@ -1307,7 +1391,7 @@ _CATEGORY_SHAPES: dict[str, str] = {
         "Skip any section not relevant to this specific question.\n\n"
     ),
     "observability": (
-        "QUESTION SHAPE: OBSERVABILITY. Every bullet a complete, speakable sentence. Opening heading is exactly "
+        "QUESTION SHAPE: OBSERVABILITY. Every bullet a keyword line, never a sentence. Opening heading is exactly "
         "'## Telemetry':\n"
         "  ## Telemetry\n"
         "    * Metrics / Logs / Traces / Events -- which matter for this question\n"
@@ -1336,7 +1420,7 @@ _CATEGORY_SHAPES: dict[str, str] = {
         "only where genuinely required.\n\n"
     ),
     "aiops": (
-        "QUESTION SHAPE: AIOPS / AI-DRIVEN OPERATIONS. Every bullet a complete, speakable sentence. Opening heading is "
+        "QUESTION SHAPE: AIOPS / AI-DRIVEN OPERATIONS. Every bullet a keyword line, never a sentence. Opening heading is "
         "exactly '## Data Sources':\n"
         "  ## Data Sources\n"
         "    * Metrics / Logs / Traces / Events / Incidents / Change records\n"
@@ -1554,10 +1638,10 @@ _CATEGORY_SHAPES: dict[str, str] = {
         "specific shape above). Every line under a heading is a SHORT bullet -- never a "
         "paragraph. Opening heading is exactly '## Direct Answer':\n"
         "  ## Direct Answer\n"
-        "    * Your actual position, stated directly, in one speakable sentence -- no "
+        "    * Your actual position as one keyword line -- no "
         "restating or reframing the question first.\n"
         "  ## Key Points\n"
-        "    * 2-4 bullets, each ONE short speakable sentence (roughly 15-25 words), "
+        "    * 2-4 bullets, each ONE keyword line (roughly 4-12 words), "
         "naming the real mechanism -- what's fixed/standardized, what's flexible, who "
         "owns which part. Real and specific, not generic platitudes.\n"
         "  ## Example  (include whenever a concrete example makes the answer land -- most "
@@ -1612,50 +1696,60 @@ _CATEGORY_SHAPES: dict[str, str] = {
 # streaming. Most categories now sit near the target; architecture and career_narrative
 # stay deliberately richer because a principal-level design answer genuinely needs the
 # sections, and those are the two the candidate skims rather than reads end to end.
+# Scaled down ~40% across the board 2026-09-02 with the switch to keyword bullets. These
+# numbers were tuned when every bullet was a full first-person sentence; a keyword line
+# carries the same technical content in roughly half the words ("* OIDC -> AWS IAM -- no
+# long-lived access keys" vs "I'd authenticate to AWS using OIDC so that we never have to
+# store long-lived access keys in the pipeline" -- 9 words against 21, same point). Left at
+# the old values these caps would stop constraining anything: the model would simply emit
+# twice as many bullets and refill the budget, which is precisely the wall of text the
+# format change exists to remove. The RELATIVE sizing between categories is unchanged --
+# architecture, migration and platform_engineering stay the richest for the reasons noted
+# below, because those are the ones the candidate skims rather than reads end to end.
 _CATEGORY_WORD_LIMITS: dict[str, int] = {
-    "trade_off": 400,
-    "leadership": 450,
-    "career_narrative": 280,  # read aloud verbatim: ~90s spoken, see the shape block
-    "tool_technology": 400,
-    "scenario_troubleshooting": 500,
-    "architecture": 700,
+    "trade_off": 240,
+    "leadership": 260,
+    "career_narrative": 180,  # six beat-bullets narrated into ~90s, see the shape block
+    "tool_technology": 240,
+    "scenario_troubleshooting": 300,
+    "architecture": 420,
     # security and cicd_devops bumped 2026-08-26: added Brief Context opening + Principal
     # Architect Decision closing to match the 12-type architect framework, same reasoning
     # as migration below.
-    "security": 450,
-    "kubernetes": 400,
-    "aws": 400,
+    "security": 270,
+    "kubernetes": 240,
+    "aws": 240,
     # Raised 2026-09-01 alongside the reshaped cicd_devops/iac_terraform shapes: concerns that
     # were sub-bullets under a single heading now each get their own section with ~2 bullets,
     # so an architect-level answer covers the whole delivery/IaC surface instead of a slice.
-    "cicd_devops": 650,
-    "sre": 400,
-    "observability": 450,
-    "aiops": 450,
-    "definition": 100,          # 3-sentence structural cap targets 60-90 words; 100 is the backstop
+    "cicd_devops": 390,
+    "sre": 240,
+    "observability": 270,
+    "aiops": 270,
+    "definition": 70,           # keyword block of 4-6 bullets; matches the optimizer backstop
     # Bumped 2026-08-26: gained Brief Context opening, expanded 8-step Migration Strategy
     # vocabulary, a Migration Flow diagram, and a Principal Architect Decision closing --
     # the old 500-word cap would force cutting one of those sections short.
     # Raised 2026-09-01 with the migration shape: it now walks the target ARCHITECTURE
     # (VPC, ingress, secrets, HA, scaling, data, observability, security, CI/CD, rollback,
     # DR) as well as the sequence, ~2 bullets per section. 550 would truncate that mid-answer.
-    "migration": 750,
-    "scalability": 450,
-    "ha_dr": 450,
-    "cost_finops": 400,
-    "failure_negative": 400,
-    "why_not": 350,
-    "behavioral": 420,
-    "project_ownership": 450,
+    "migration": 450,
+    "scalability": 270,
+    "ha_dr": 270,
+    "cost_finops": 240,
+    "failure_negative": 240,
+    "why_not": 210,
+    "behavioral": 250,
+    "project_ownership": 270,
     # Added 2026-08-26: Platform Engineering and IaC/Terraform have multi-section shapes
     # (Brief Context + Architecture/Platform breakdown + Flow diagram + Principal Architect
     # Decision + closing) comparable in depth to cicd_devops/security, sized accordingly.
-    "platform_engineering": 750,
-    "iac_terraform": 650,
+    "platform_engineering": 450,
+    "iac_terraform": 390,
     # Retuned 2026-08-26: user feedback rejected a 200+ word default-category answer as
-    # too long/essay-like for a live interview -- target 30-60s spoken (~120-180 words at
-    # natural pace) for this category's Direct Answer/Key Points/Example/Judgment shape.
-    "default": 180,
+    # too long/essay-like for a live interview -- target 30-60s spoken for this category's
+    # Direct Answer/Key Points/Example/Judgment shape.
+    "default": 110,
 }
 
 
@@ -2114,9 +2208,10 @@ def build_system_prompt(config: LlmConfig | None = None, question_text: str = ""
         # up leaves only the per-category shape and word limit uncached.
         + _SHARED_FORMATTING_MECHANICS
         + _ANSWER_THE_EXACT_QUESTION
+        + _ARCHITECT_DEPTH_RULES
         + CACHE_BREAKPOINT
         + shape_block
-        + _SPEAKABLE_OUTPUT_FINAL
+        + _CHEATSHEET_OUTPUT_FINAL
         + "Domain coverage when relevant: Kubernetes -> HA, GitOps/ArgoCD, Helm, autoscaling, "
         "PodDisruptionBudgets, observability, security, rollbacks. AWS -> Multi-AZ, "
         "multi-region, IAM, networking, cost optimization, DR, auto scaling, monitoring. "
