@@ -25,6 +25,11 @@ _EXPANDED_SIZE = (680, 820)
 _PANEL_COLOR = QColor(20, 20, 24, 235)
 _PANEL_RADIUS = 12.0
 
+# How many recent question/answer pairs stay on screen at once, newest first. The
+# candidate often gets a follow-up that only makes sense against the previous answer
+# ("and how would that change if..."), so the prior pair needs to stay readable.
+_HISTORY_SIZE = 2
+
 # Small, unobtrusive inline indicator -- normal operation, never meant to draw the eye.
 # AUDIO_SILENT is deliberately NEUTRAL (white/gray, not a caution color) -- it means "the
 # interviewer isn't talking right now" (routinely true for the entire time the candidate is
@@ -51,6 +56,13 @@ class OverlayWindow(QWidget):
         self._expanded = False
         # Cursor-to-window offset held while dragging; None when not dragging.
         self._drag_offset: QPoint | None = None
+
+        # Recent Q&A pairs, newest at index 0, capped at _HISTORY_SIZE. Each entry is
+        # {"q": str, "a": str, "confidence": float, "low_confidence": bool}.
+        self._history: list[dict] = []
+        # True while the newest entry is a partial still streaming in -- the next partial
+        # updates it in place; the first partial after a completed answer starts a new one.
+        self._streaming = False
 
         self._apply_window_flags()
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -175,10 +187,19 @@ class OverlayWindow(QWidget):
         """Called as the answer streams in, before the final formatted/confidence-gated
         version replaces it via show_answer() -- gets text on screen within ~seconds
         instead of waiting for the whole answer. May briefly show the trailing
-        `CONFIDENCE: N` marker right before show_answer() strips and replaces it."""
-        self._header_label.setText("meeting-copilot — answering…")
-        self._answer_label.setText(text_so_far)
-        self._confidence_label.setText("")
+        `CONFIDENCE: N` marker right before show_answer() strips and replaces it.
+
+        The partial carries no question text (see api.py broadcast_partial_answer), so the
+        newest entry shows an "answering…" placeholder until show_answer() backfills it."""
+        if self._streaming and self._history:
+            self._history[0]["a"] = text_so_far
+        else:
+            self._history.insert(
+                0, {"q": "", "a": text_so_far, "confidence": 0.0, "low_confidence": False}
+            )
+            del self._history[_HISTORY_SIZE:]
+            self._streaming = True
+        self._render()
         self.show()
         self.raise_()
 
@@ -186,14 +207,57 @@ class OverlayWindow(QWidget):
         text = answer.get("text", "")
         confidence = answer.get("confidence", 0.0)
         low_confidence = answer.get("low_confidence", False)
-
-        self._header_label.setText(
-            "meeting-copilot — low confidence" if low_confidence else "meeting-copilot"
+        question = (
+            ((answer.get("question") or {}).get("transcript") or {}).get("text") or ""
         )
-        self._answer_label.setText(text)
-        self._confidence_label.setText(f"confidence: {confidence * 100:.0f}%")
+        entry = {
+            "q": question,
+            "a": text,
+            "confidence": confidence,
+            "low_confidence": low_confidence,
+        }
+
+        if self._streaming and self._history:
+            self._history[0] = entry
+        else:
+            self._history.insert(0, entry)
+            del self._history[_HISTORY_SIZE:]
+        self._streaming = False
+
+        self._render()
+        self._scroll.verticalScrollBar().setValue(0)
         self.show()
         self.raise_()
+
+    def _render(self) -> None:
+        """Rebuild the answer panel from _history -- newest pair on top, older pairs below
+        a divider."""
+        blocks: list[str] = []
+        for idx, entry in enumerate(self._history):
+            if entry["q"]:
+                heading = f"**Q: {entry['q']}**"
+            elif idx == 0 and self._streaming:
+                heading = "**Q: …**"
+            else:
+                heading = ""
+            parts = [p for p in (heading, entry["a"]) if p]
+            blocks.append("\n\n".join(parts))
+        self._answer_label.setText("\n\n---\n\n".join(blocks))
+
+        newest_entry = self._history[0] if self._history else None
+        if self._streaming:
+            self._header_label.setText("meeting-copilot — answering…")
+            self._confidence_label.setText("")
+        elif newest_entry and newest_entry["low_confidence"]:
+            self._header_label.setText("meeting-copilot — low confidence")
+            self._confidence_label.setText(
+                f"confidence: {newest_entry['confidence'] * 100:.0f}%"
+            )
+        elif newest_entry:
+            self._header_label.setText("meeting-copilot")
+            self._confidence_label.setText(
+                f"confidence: {newest_entry['confidence'] * 100:.0f}%"
+            )
 
     def show_audio_health(self, data: dict) -> None:
         """Reflects an AudioHealth state transition (see audio/capture.py, pipeline/
@@ -232,4 +296,6 @@ class OverlayWindow(QWidget):
         self.resize(*(_EXPANDED_SIZE if self._expanded else _COLLAPSED_SIZE))
 
     def copy_answer(self) -> None:
-        QGuiApplication.clipboard().setText(self._answer_label.text())
+        """Copy only the newest answer -- the one the candidate is speaking to now."""
+        newest = self._history[0]["a"] if self._history else ""
+        QGuiApplication.clipboard().setText(newest)
