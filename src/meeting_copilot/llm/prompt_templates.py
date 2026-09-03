@@ -30,6 +30,19 @@ def _classify_category(question_text: str) -> str:
     than the narrower standalone kubernetes template."""
     t = question_text.lower()
 
+    # STAR OPENERS FIRST -- hoisted above every domain bucket 2026-09-03. "Tell us about a
+    # time you led a migration" was returning `migration`, because that keyword check
+    # returns far earlier in this function. An explicit "tell me about a time" is the least
+    # ambiguous signal here: the question is about the candidate's story and the domain noun
+    # in it is incidental, so nothing downstream should be able to take it.
+    if any(m in t for m in ("tell me about a time", "tell us about a time",
+                            "describe a time", "give me an example of a time",
+                            "give us an example of a time", "walk me through a time",
+                            "walk us through a time", "take me through a time",
+                            "run me through a time", "talk me through a time")):
+        return "behavioral"
+
+
     # "why not X" / "why didn't you use X" -- a challenge to a decision already made.
     # Checked first: it is lexically unmistakable and must not be swallowed by trade_off.
     if re.search(r"\bwhy (not|didn'?t|don'?t|wouldn'?t)\b", t):
@@ -107,9 +120,6 @@ def _classify_category(question_text: str) -> str:
 
     # Behavioral STAR -- "tell me about a time" is the classic opener and gets the STAR
     # shape rather than the leadership shape.
-    if any(m in t for m in ("tell me about a time", "describe a time",
-                            "give me an example of a time", "walk me through a time")):
-        return "behavioral"
 
     # Same STAR opener with adjectives in the way -- "tell me about a TECHNICAL mistake",
     # "describe a CHALLENGING production incident", "give me an example of a DIFFICULT
@@ -119,10 +129,29 @@ def _classify_category(question_text: str) -> str:
     # exists to prevent. Bounded to a past-experience opener so it cannot steal a design
     # question.
     if re.search(
-        r"\b(tell me about|describe|walk me through|give me an example of|share)\b"
+        r"\b(tell me about|describe|walk me through|walk us through|run me through|"
+        r"run us through|take me through|take us through|talk me through|"
+        r"give me an example of|give us an example of|gimme an example of|"
+        r"share|tell us about)\b"
         r"(?:\s+\w+){0,4}?\s+"
         r"\b(mistake|failure|challenge|conflict|disagreement|incident|outage|"
-        r"problem|situation|experience|decision|ticket|escalation)\b",
+        r"problem|situation|experience|decision|ticket|escalation|time)\b",
+        t,
+    ):
+        return "behavioral"
+
+    # PAST-TENSE OWNERSHIP, colloquially phrased. Added 2026-09-03: American interviewers
+    # ask for a STAR story without any of the formal openers -- "gimme an example of
+    # something you automated", "anything you've built with Python", "a time you fixed a
+    # nasty IAM issue". Detection already caught these; routing sent them to the `default`
+    # catch-all (110-word cap, generic shape) or to a domain bucket, so a textbook STAR
+    # question got the wrong shape entirely. Anchored on a PAST-TENSE verb about the
+    # candidate's own work so it cannot steal a hypothetical design question.
+    if re.search(
+        r"\b(a time|an example|something|anything)\b(?:\s+\w+){0,3}?\s+"
+        r"\byou(?:'ve| have)?\s+"
+        r"(automated|built|fixed|resolved|debugged|handled|designed|led|owned|"
+        r"migrated|improved|shipped|delivered|troubleshot|solved)\b",
         t,
     ):
         return "behavioral"
@@ -155,6 +184,16 @@ def _classify_category(question_text: str) -> str:
         "tell me about a difficult",
     )):
         return "leadership"
+
+    # "What's your experience with X" / "have you used X" -- a tool question, and for a
+    # tool on the honest-gap list the answer is the bulleted gap framing. Added 2026-09-03:
+    # these were falling to the `default` catch-all, which has no tool shape at all.
+    if re.search(
+        r"\b(your experience with|experience working with|have you (?:used|worked with)|"
+        r"familiar with|worked with)\b",
+        t,
+    ):
+        return "tool_technology"
 
     if any(m in t for m in (
         "tell me about yourself", "walk me through your background",
@@ -239,6 +278,29 @@ def _classify_category(question_text: str) -> str:
     if any(m in t for m in (
         "triage", "walk me through your triage", "on-call",
     )):
+        return "scenario_troubleshooting"
+
+    # Colloquial scenario framing. Added 2026-09-03: "suppose a Harness stage fails on
+    # deploy, what then" and "let's say the app can't reach RDS" are how a US interviewer
+    # actually hands you a scenario -- no "how would you", no "?" necessarily. Requires a
+    # failure word alongside the setup so a neutral hypothetical ("suppose you have 50
+    # teams") still routes on its own merits.
+    if re.search(
+        r"\b(suppose|let's say|lets say|say you|imagine|picture this)\b", t
+    ) and re.search(
+        r"\b(fail|fails|failing|failed|down|broken|breaks|error|errors|denied|"
+        r"can't|cannot|timeout|times out|stuck|slow|unable)\b",
+        t,
+    ):
+        return "scenario_troubleshooting"
+
+    # "I'm curious how you'd handle/debug/troubleshoot X" -- the interrogative is buried,
+    # so the method-question regex below misses it.
+    if re.search(
+        r"\b(curious|wondering)\b.{0,40}\b(handle|debug|troubleshoot|diagnose|"
+        r"investigate|approach|deal with|fix)\b",
+        t,
+    ):
         return "scenario_troubleshooting"
 
     # METHOD questions -- "how do you troubleshoot X?" asks for the diagnostic SEQUENCE in

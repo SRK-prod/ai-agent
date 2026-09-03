@@ -112,7 +112,10 @@ class DeepgramEngine:
         # Deepgram's keyterm prompting is the direct equivalent of Whisper's initial_prompt,
         # so the domain vocabulary that stops "OOMKilled" becoming "OOM killed" carries over
         # rather than being re-solved. nova-3 uses `keyterm`; older models use `keywords`.
-        terms = [t.strip() for t in (self._cfg.initial_prompt or "").split(",") if t.strip()]
+        # Was reusing initial_prompt -- the 28-term hint tuned for Whisper's decoder.
+        # Deepgram takes up to 100 boost terms and does not suffer the attention
+        # dilution that kept that list short, so it gets its own fuller list.
+        terms = self._cfg.keyterms
         if terms:
             key = "keyterm" if self._cfg.deepgram_model.startswith("nova-3") else "keywords"
             params[key] = terms[: self._cfg.deepgram_max_keyterms]

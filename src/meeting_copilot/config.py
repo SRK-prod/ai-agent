@@ -197,6 +197,50 @@ class SttConfig(BaseModel):
     # but loses the compound terms.
     vocabulary_hint_mode: Literal["short", "full", "none"] = "short"
 
+    # DEEPGRAM KEYTERMS -- deliberately LONGER than vocabulary_hint_short, and that is not a
+    # contradiction of the measurement above. That measurement is about Whisper's
+    # initial_prompt, which primes a decoder: a long hint dilutes its attention and measurably
+    # turned "OOMKilled" back into "OOM killed". Deepgram keyterm prompting is a keyword BOOST
+    # list, not a decoder prime -- nova-3 accepts up to 100 terms and extra entries do not
+    # compete for attention the same way. Using the 28-term Whisper hint on Deepgram was
+    # leaving 72 slots unused while missing every proper noun this interview turns on.
+    #
+    # Scope rule: only terms that are (a) phonetically fragile and (b) plausible in THIS
+    # interview. "Harness" is the sharpest example -- as a common English noun it will
+    # transcribe as lowercase "harness" in a sentence like "our harness pipeline failed", and
+    # the classifier keys on the product name.
+    deepgram_keyterms: str = (
+        # today's Support DevOps Engineer JD surface
+        "Harness, ECS, Fargate, ECR, task definition, task role, execution role, "
+        "AccessDenied, OIDC, ALB, NLB, target group, security group, NACL, PrivateLink, "
+        "VPC endpoint, NAT gateway, ENI, subnet, Route 53, ACM, SNI, TLS handshake, "
+        "CloudTrail, CloudWatch, Secrets Manager, SCP, permission boundary, IAM, KMS, "
+        "policy simulator, assume role, trust policy, least privilege, "
+        "circuit breaker, health check, rollback, blue-green, canary, "
+        # container / platform terms that mis-transcribe phonetically
+        "Kubernetes, EKS, AKS, GKE, OOMKilled, CrashLoopBackOff, kubectl, Helm, "
+        "Terraform, OpenTofu, GitOps, ArgoCD, CI/CD, "
+        # AWS services that get mangled
+        "Lambda, DynamoDB, Aurora, RDS, S3, EC2, Bedrock, "
+        # role / practice vocabulary
+        "SLO, SLI, SRE, AIOps, RCA, root cause, runbook, on-call, observability, "
+        "Prometheus, Grafana, Datadog, Splunk, JIRA, Agentic AI, RAG"
+    )
+
+    @property
+    def keyterms(self) -> list[str]:
+        """Keyterm list for the cloud backend. Falls back to the Whisper hint if the
+        Deepgram list is somehow blank, so this can never silently send nothing."""
+        source = self.deepgram_keyterms or self.vocabulary_hint_short or ""
+        seen: set[str] = set()
+        out: list[str] = []
+        for term in (t.strip() for t in source.split(",")):
+            key = term.lower()
+            if term and key not in seen:
+                seen.add(key)
+                out.append(term)
+        return out
+
     @property
     def initial_prompt(self) -> str | None:
         """The initial_prompt actually handed to faster-whisper -- see vocabulary_hint_mode."""

@@ -53,6 +53,40 @@ _INTERROGATIVE_OPENERS = (
     "was this",
     "i want to understand",
     "i want to know",
+    # Colloquial US interview phrasing, added 2026-09-03. American interviewers routinely
+    # open a question with these and none of them contain a classic interrogative word, so
+    # the question would only be caught by a trailing "?" -- which conversational speech
+    # often loses in transcription.
+    "run me through",
+    "run us through",
+    "talk me through",
+    "talk us through",
+    "talk to me about",
+    "take me through",
+    "take us through",
+    "walk through",
+    "gimme",
+    "give us an example",
+    "lemme ask",
+    "let me ask",
+    "i'm curious",
+    "im curious",
+    "curious how",
+    "curious about",
+    "any thoughts",
+    "thoughts on",
+    "your take on",
+    "speak to",
+    "get into",
+    "dig into",
+    # Scenario setups -- not interrogative, but they always precede the real ask, and
+    # holding them as context is exactly what the scenario-buildup path is for.
+    "let's say",
+    "lets say",
+    "say you",
+    "suppose",
+    "imagine",
+    "picture this",
 )
 
 
