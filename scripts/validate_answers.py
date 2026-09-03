@@ -58,6 +58,13 @@ QUESTION_BANK: list[tuple[str, str]] = [
     ("support-network", "After a security group change the app can't reach RDS, what do you check?"),
     ("support-tls", "Service onboarding fails with a TLS handshake error, how do you troubleshoot?"),
     ("support-rca", "How do you do root cause analysis for a recurring deployment failure?"),
+    # Seven-shape coverage (added 2026-09-03) -- one probe per master shape.
+    ("star", "Tell me about a time you resolved a difficult production issue"),
+    ("star", "Tell me about a technical mistake you made"),
+    ("incident", "Production is down. What do you do?"),
+    ("knowledge", "How does Terraform work?"),
+    ("rapidfire", "What is a security group?"),
+    ("comparison", "ECS vs EKS - which would you choose?"),
 ]
 
 _MAX_BULLET_WORDS = 14
