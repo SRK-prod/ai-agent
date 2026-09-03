@@ -51,6 +51,13 @@ QUESTION_BANK: list[tuple[str, str]] = [
     ("why-not", "Why not just use CloudFormation instead of Terraform?"),
     ("definition", "What is OpenTelemetry?"),
     ("career", "Tell me about yourself"),
+    # Support DevOps Engineer JD surface (added 2026-09-03) -- operational tickets, not design.
+    ("support-ecs", "An application intermittently fails to deploy to ECS, how do you debug it?"),
+    ("support-harness", "A Harness pipeline stage keeps failing on deploy, walk me through it"),
+    ("support-iam", "A role is getting AccessDenied calling S3, how do you resolve it?"),
+    ("support-network", "After a security group change the app can't reach RDS, what do you check?"),
+    ("support-tls", "Service onboarding fails with a TLS handshake error, how do you troubleshoot?"),
+    ("support-rca", "How do you do root cause analysis for a recurring deployment failure?"),
 ]
 
 _MAX_BULLET_WORDS = 14

@@ -211,6 +211,27 @@ def _classify_category(question_text: str) -> str:
     )):
         return "scenario_troubleshooting"
 
+    # Support-ticket framing wins over a bare domain-keyword match below -- added
+    # 2026-09-03 for the Support DevOps Engineer JD. "an IAM action is denied, how do you
+    # resolve it" / "security-group change and the app times out" / "TLS handshake fails
+    # on onboarding" are support tickets that need the Situation->Investigation->Root
+    # Cause->Fix shape, not the security/aws/kubernetes DESIGN shape their domain keyword
+    # ("iam", "security group", "rds") would otherwise route them to. Kept to phrasings
+    # that are unambiguously a live failure being reported, not a design prompt.
+    if any(m in t for m in (
+        "access denied", "accessdenied", "permission denied", "is denied",
+        "getting denied", "keeps failing", "intermittent", "intermittently", "flaky",
+        "can't connect", "cannot connect", "can't reach", "cannot reach",
+        "unable to reach", "connection refused", "connection timed out", "times out",
+        "timing out", "handshake failed", "handshake fails", "certificate error",
+        "cert error", "ssl error", "tls error", "cert expired", "certificate expired",
+        "pipeline failed", "pipeline failure", "pipeline is failing", "stage failed",
+        "deployment failed", "deploy failed", "deployment keeps", "rollout stuck",
+        "stuck in progress", "won't start", "wont start", "fails to start",
+        "failing to deploy", "not able to deploy",
+    )):
+        return "scenario_troubleshooting"
+
     # Pure definitional phrasing ("what is X", "how does X work") wins over a domain
     # keyword match below -- "What is OpenTelemetry?" is a tool/technology explainer
     # question, not an observability-platform design question, even though it names a
@@ -610,7 +631,9 @@ _CHEATSHEET_OUTPUT_FINAL = (
     "not say you need to clarify, do not mention the question wording. State your reading "
     "implicitly by just answering it.\n"
     "  7. TWO LISTS, NOT A SECTION WALK. The normal shape is one '## Answer' list of "
-    "mechanism bullets, then one '## Architect Decision' list of exactly 2 bullets. Add a '## "
+    "mechanism bullets, then one closing list of 2-3 bullets -- '## Architect Decision' "
+    "normally, or the closing-list heading the category shape names (e.g. '## Root Cause & "
+    "Fix' for a troubleshooting answer). Add a '## "
     "Flow' ASCII line ONLY when there is a real request path or sequence. Do NOT produce "
     "'## Brief Context', '## Source and Branching', '## Monitoring' and eight more headed "
     "sections -- that is the section-walk failure this format replaced. A category shape "
@@ -1152,34 +1175,33 @@ _CATEGORY_SHAPES: dict[str, str] = {
         "question -- a quick definitional ask doesn't need all 9 sections.\n\n"
     ),
     "scenario_troubleshooting": (
-        "QUESTION SHAPE: SCENARIO / TROUBLESHOOTING / PRODUCTION INCIDENT. Speakable full-sentence bullets "
-        "throughout. Opening heading is exactly '## Situation':\n"
-        "  ## Situation\n"
-        "    * What is happening, terse\n"
-        "  ## Customer Impact\n"
-        "    * Customer-facing? Business impact? SLO impact?\n"
-        "  ## Initial Checks\n"
-        "    * Recent deployment? Config change? Infra change? Traffic change?\n"
-        "  ## Investigation\n"
-        "    * Metrics / Logs / Traces / Dependencies -- what you'd actually look at\n"
-        "  ## Tools\n"
-        "    * Only tools genuinely relevant to THIS scenario, 'Tool -- what it tells you' "
-        "shape (e.g. 'Prometheus -- latency, error rate, saturation')\n"
-        "  ## Hypotheses\n"
-        "    * Application / Infrastructure / Database / Network / Dependency\n"
-        "  ## Immediate Mitigation\n"
-        "    * Rollback / Failover / Scale / Traffic shift / Disable feature -- whichever "
-        "genuinely applies\n"
-        "  ## Root Cause\n"
-        "    * The actual evidence-based conclusion, terse -- correlate to the earliest "
-        "abnormal signal, not the loudest alert\n"
-        "  ## Permanent Fix\n"
-        "    * Code / Infrastructure / Configuration / Capacity / Architecture\n"
-        "  ## Prevention\n"
-        "    * Monitoring / Alerting / Automation / Runbook / Testing -- only if there's a "
-        "genuine follow-up action worth naming\n"
-        "A single fenced code block for any commands you'd actually run -- never inline in "
-        "a bullet. Skip any section with nothing concrete to add for this scenario.\n\n"
+        "QUESTION SHAPE: SCENARIO / TROUBLESHOOTING / SUPPORT TICKET / PRODUCTION INCIDENT. "
+        "Rewritten 2026-09-03 to the cheat-sheet shape: the previous ten-section walk "
+        "(Situation, Customer Impact, Initial Checks, Investigation, Tools, Hypotheses, "
+        "Mitigation, Root Cause, Permanent Fix, Prevention) produced 400-500 word "
+        "sentence-bullet answers -- unreadable at a glance mid-interview. What an "
+        "interviewer wants is the INVESTIGATION SEQUENCE and the call behind it, glanceable "
+        "in two seconds.\n"
+        "  ## Answer\n"
+        "    * An ordered list of investigation-step bullets, each 'CHECK -- signal it "
+        "gives', 4-12 words, no trailing clause -- e.g. 'ECS service events -- why tasks "
+        "are stopping', 'awslogs / CloudWatch -- app exit reason', 'Target group health -- "
+        "failing which check', 'Task IAM role -- denied API call', 'Recent change -- new "
+        "task def or image?'. Order them the way you'd actually check: cheapest / most "
+        "likely first.\n"
+        "    * Name the real console page, CLI command, or log line in each bullet. A "
+        "command goes in a fenced block, never inline in a bullet.\n"
+        "    * Pick only the checks THIS scenario turns on. An IAM-denied ticket does not "
+        "need a target-group bullet.\n"
+        "  ## Flow  (only if the failure is a chain worth drawing)\n"
+        "    A compact ASCII line, e.g. 'Deploy -> task starts -> health check fails -> "
+        "circuit breaker -> rollback'.\n"
+        "  ## Root Cause & Fix\n"
+        "    * 2 or 3 bullets, 'LABEL -- call': the evidence-based root cause (correlate to "
+        "the EARLIEST abnormal signal, not the loudest alert), the immediate fix, and one "
+        "prevention step that is a concrete artifact (an alarm, a guardrail, a script, a "
+        "runbook) -- never 'add monitoring'.\n"
+        "    * Bullets only here too -- never a prose paragraph.\n\n"
     ),
     "architecture": (
         "QUESTION SHAPE: ARCHITECTURE / SYSTEM DESIGN -- applies uniformly to cloud, "
@@ -1717,7 +1739,12 @@ _CATEGORY_WORD_LIMITS: dict[str, int] = {
     "leadership": 260,
     "career_narrative": 180,  # six beat-bullets narrated into ~90s, see the shape block
     "tool_technology": 240,
-    "scenario_troubleshooting": 300,
+    # scenario_troubleshooting CUT 2026-09-03 (300 -> 180) alongside the shape rewrite to
+    # the ## Answer + ## Root Cause & Fix cheat-sheet form -- a support ticket wants the
+    # investigation sequence glanceable, not a 450-word ten-section incident report. A
+    # genuinely broad multi-symptom production incident may run over; the "smallest number
+    # of bullets" rule in _CHEATSHEET_OUTPUT_FINAL lets depth expand only when needed.
+    "scenario_troubleshooting": 180,
     "architecture": 420,
     # security and cicd_devops CUT 2026-09-02 back to cheat-sheet size. Real Claude output
     # for "how do you handle secrets in GitHub Actions?" ran 390 words over 7 headed
