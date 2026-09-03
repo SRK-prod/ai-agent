@@ -223,7 +223,10 @@ class SttConfig(BaseModel):
         # AWS services that get mangled
         "Lambda, DynamoDB, Aurora, RDS, S3, EC2, Bedrock, "
         # role / practice vocabulary
-        "SLO, SLI, SRE, AIOps, RCA, root cause, runbook, on-call, observability, "
+        # "RCA" removed 2026-09-03: on real interview audio it collided with "CI/CD",
+        # which came back as "RCA CD pipeline". "root cause" covers the concept
+        # without the acronym competing against a term that matters more here.
+        "SLO, SLI, SRE, AIOps, root cause, runbook, on-call, observability, "
         "Prometheus, Grafana, Datadog, Splunk, JIRA, Agentic AI, RAG"
     )
 

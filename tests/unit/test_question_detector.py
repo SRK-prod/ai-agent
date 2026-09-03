@@ -87,7 +87,52 @@ def test_min_words_threshold_is_configurable():
         denylist_phrases=[], keywords=[], min_words_for_bare_question_mark=1
     )
     detector = RuleBasedQuestionDetector(lenient_cfg)
-    assert detector.detect(_transcript("Right?")) is not None
+    # Example changed from "Right?" 2026-09-03: that is now stripped as a conversational
+    # tag question (see _strip_tag_questions -- a real recorded US interview used "Right?"
+    # 14 times in five minutes while EXPLAINING the role, and every one read as a
+    # question). "Why?" is a genuine one-word follow-up, which is what this threshold is
+    # actually for.
+    assert detector.detect(_transcript("Why?")) is not None
+
+
+def test_conversational_tag_questions_are_not_questions():
+    """US speech tags statements with "Right?" / "You know?". Those are discourse markers.
+
+    Measured by replaying a real recorded interview: treating them as questions turned five
+    minutes of the interviewer describing the role into 12 spurious answers.
+    """
+    detector = RuleBasedQuestionDetector(CFG)
+    for statement in (
+        "We have platforms. We have networking. Right?",
+        "So we're using our pipelines to make changes. Right?",
+        "The environment is optimized. You know?",
+    ):
+        result = detector.detect(_transcript(statement))
+        assert result is None or not result.has_interrogative_signal, (
+            f"tag question read as a real question: {statement!r}"
+        )
+    # ...but a tag on the end of a REAL question must not suppress it.
+    real = detector.detect(_transcript("How would you troubleshoot that, right?"))
+    assert real is not None and real.has_interrogative_signal
+
+
+def test_bare_wh_word_needs_an_interrogative_construction():
+    """"That's where this comes in handy" is a relative clause, not a question."""
+    detector = RuleBasedQuestionDetector(CFG)
+    for statement in (
+        "So that's where this Terraform comes in handy.",
+        "What I understand from you is that we handle support tickets.",
+    ):
+        result = detector.detect(_transcript(statement))
+        assert result is None or not result.has_interrogative_signal, (
+            f"relative clause read as a question: {statement!r}"
+        )
+    # A question buried mid-segment must still be found -- that is why the search is not
+    # anchored to the start of the utterance.
+    buried = detector.detect(
+        _transcript("Anyway, we can move on from that. How would you design the pipeline?")
+    )
+    assert buried is not None and buried.has_interrogative_signal
 
 
 def test_interview_phrasing_without_question_mark_triggers():

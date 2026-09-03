@@ -977,9 +977,20 @@ class MeetingPipeline:
             # this as more scenario instead. When there's NO active buildup, this stays
             # exactly as before: catching a real STANDALONE question that has a keyword or
             # technical density but happened to lose its interrogative wording to STT.
-            if question is None or (
-                not question.has_interrogative_signal and mid_scenario_buildup
-            ):
+            # Widened 2026-09-03 from "... and mid_scenario_buildup" to hold a
+            # declarative statement from the FIRST sentence, not just once a buildup is
+            # already running. Measured by replaying a real recorded US interview: five
+            # minutes of the interviewer explaining the role produced ~20 answers, because
+            # sentence one was answered (no buildup active yet, so this guard could not
+            # fire), which set _last_answered, and every following sentence then merged
+            # into it through the revision path at one Claude call each.
+            #
+            # The cost, stated plainly and previously accepted as deliberate: a real
+            # question that loses BOTH its question mark and every interrogative word to
+            # STT is now held instead of answered. Real audio says that is much rarer than
+            # the monologue case, and the held text is picked up by the next utterance
+            # rather than lost.
+            if question is None or not question.has_interrogative_signal:
                 # Not phrased as a question, but a real declarative sentence is almost
                 # always scenario setup ("the two services show anomalies with no direct
                 # dependency") that the interviewer will assume as given once the actual
