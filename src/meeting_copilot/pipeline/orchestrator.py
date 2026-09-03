@@ -717,6 +717,18 @@ class MeetingPipeline:
                     # may classify into a different category on its own, but it is a scope
                     # qualifier on the prior question, not a new topic.
                     or _is_trailing_continuation(transcript.text)
+                    # A DECLARATIVE SENTENCE IS SCENARIO SETUP, NEVER A TOPIC CHANGE.
+                    # Fixed 2026-09-03 by tracing the exact live pattern -- interviewer
+                    # gives ~40s of background, then asks. "The platform needs to support
+                    # GCP as well." is 8 words, which tripped _is_topic_change's LENGTH
+                    # fallback (_MIN_WORDS_FOR_STANDALONE_QUESTION) and started a fresh
+                    # turn, discarding the AWS and compliance context already accumulated.
+                    # That fallback is explicitly documented as a heuristic for "a
+                    # substantial, grammatically complete QUESTION" -- a statement with no
+                    # interrogative signal at all is not one, so it must not be judged on
+                    # length. An explicit pivot ("let's move on") still splits, via
+                    # _is_question_enhancement above.
+                    or not self._reads_as_independent_question(transcript)
                 )
                 and self._revision_count < _MAX_REVISION_QUESTIONS
             ):
@@ -761,7 +773,23 @@ class MeetingPipeline:
                     end_time=transcript.end_time,
                     language=transcript.language,
                 )
-                self._revision_count += 1
+                # SCENARIO SETUP DOES NOT SPEND THE REVISION BUDGET. Fixed 2026-09-03
+                # after a preflight run of the exact live pattern -- interviewer gives ~60s
+                # of background, then asks. The setup sentences match a technical keyword,
+                # so each one came through here as a "revision", exhausted
+                # _MAX_REVISION_QUESTIONS before the real question arrived, and the real
+                # question then started a FRESH turn that had lost two thirds of the
+                # context ("compliance" and "GCP" never reached the model).
+                #
+                # That cap exists to stop six genuinely UNRELATED QUESTIONS merging into one
+                # unreadable answer. A declarative sentence carrying no interrogative signal
+                # is not a question, so it must not consume that budget -- it is the
+                # scenario the eventual question depends on. Counting only real questions
+                # keeps the cap doing its job while letting arbitrarily long buildup
+                # accumulate.
+                addition_is_a_question = self._reads_as_independent_question(transcript)
+                if addition_is_a_question:
+                    self._revision_count += 1
                 wait_seconds = _QUESTION_DEBOUNCE_SECONDS
             else:
                 # Genuinely new turn -- no active answer to revise (none yet, outside the
@@ -815,6 +843,15 @@ class MeetingPipeline:
         """
         lowered = transcript.text.lower().strip()
         if any(m in lowered for m in _ANAPHORA_MARKERS):
+            return False
+        # A question ENDING in a bare demonstrative is anaphoric by construction: "so what
+        # would you do?", "how would you architect this?", "what would you do about that?"
+        # carry no subject of their own -- the subject is everything the interviewer just
+        # said. Found 2026-09-03 tracing the live pattern: after ~40s of scenario buildup
+        # the closing ask started a FRESH turn and threw the entire scenario away.
+        # Deliberately anchored to the END of the utterance, so "how would you design this
+        # PLATFORM?" -- which names its own subject -- is still independent.
+        if re.search(r"\b(this|that|it)\s*[?.!]*\s*$", lowered):
             return False
         # Opens with a conjunction/preposition/article ("for GCP and AWS with multi-cloud")
         # -- grammatically a continuation of the prior utterance, so it folds in with plain

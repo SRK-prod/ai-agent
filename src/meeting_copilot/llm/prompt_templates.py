@@ -21,6 +21,45 @@ CONFIDENCE_MARKER = "CONFIDENCE:"
 CACHE_BREAKPOINT = "\n<<<PROMPT_CACHE_BREAKPOINT>>>\n"
 
 
+# US SPOKEN CONTRACTIONS -- expanded before classification (see _classify_category).
+# Every pattern in the classifier is written in full form ("how would you design"), but an
+# American interviewer says "how you'd design", "what'd you do", "gimme an example".
+# Measured 2026-09-03 on ten realistic spoken questions: four fell to the `default`
+# catch-all purely on contraction, including "What'd you do when your Harness pipeline kept
+# failing?" -- a textbook STAR question landing on a 110-word generic shape.
+#
+# DELIBERATELY PARTIAL. Contractions that appear LITERALLY in existing pattern lists are
+# left alone, because expanding them would remove matches that currently work:
+#   "let's say" / "can't connect" / "isn't working" / "won't start" / "what's" / "i'm
+#   curious" are all spelled contracted somewhere below.
+# The rule for adding here: expand only where it can add a match and cannot remove one.
+_CONTRACTIONS = (
+    ("what'd", "what did"),
+    ("how'd", "how would"),
+    ("you'd", "you would"),
+    ("we'd", "we would"),
+    ("they'd", "they would"),
+    ("you've", "you have"),
+    ("we've", "we have"),
+    ("gimme", "give me"),
+    ("lemme", "let me"),
+    ("gonna", "going to"),
+    ("wanna", "want to"),
+    ("gotta", "got to"),
+    ("kinda", "kind of"),
+    ("sorta", "sort of"),
+)
+
+
+def _expand_contractions(text: str) -> str:
+    """Lowercased text with spoken contractions expanded to the full forms the patterns
+    below are written in. Applied to a COPY used for matching only -- the original question
+    text still reaches the model verbatim."""
+    for short, full in _CONTRACTIONS:
+        text = text.replace(short, full)
+    return text
+
+
 def _classify_category(question_text: str) -> str:
     """Classify by question SHAPE, not topic -- a Kubernetes question can be scenario,
     architecture, security or comparison depending on phrasing. Checked in priority order:
@@ -28,7 +67,7 @@ def _classify_category(question_text: str) -> str:
     question ("RAG vs fine-tuning") still gets the trade_off template, and a "design a
     highly available EKS platform" question gets the full architecture template rather
     than the narrower standalone kubernetes template."""
-    t = question_text.lower()
+    t = _expand_contractions(question_text.lower())
 
     # STAR OPENERS FIRST -- hoisted above every domain bucket 2026-09-03. "Tell us about a
     # time you led a migration" was returning `migration`, because that keyword check
@@ -140,6 +179,19 @@ def _classify_category(question_text: str) -> str:
     ):
         return "behavioral"
 
+    # PAST-TENSE PERSONAL EXPERIENCE, no story noun. "What'd you do when your Harness
+    # pipeline kept failing?" expands to "what did you do when..." -- unmistakably a request
+    # for what the candidate ACTUALLY DID, but it names no "time"/"example"/"situation" for
+    # the STAR regex below to key on, so it was falling to the `default` catch-all.
+    # Past tense is the whole signal here: "what WOULD you do when..." is a scenario and
+    # must not match, which is why this is anchored on "did"/"have you ever".
+    if re.search(
+        r"\b(what did you do|what did you end up|how did you end up|"
+        r"what happened when|how did you handle it|have you ever had to)\b",
+        t,
+    ):
+        return "behavioral"
+
     # PAST-TENSE OWNERSHIP, colloquially phrased. Added 2026-09-03: American interviewers
     # ask for a STAR story without any of the formal openers -- "gimme an example of
     # something you automated", "anything you've built with Python", "a time you fixed a
@@ -217,9 +269,21 @@ def _classify_category(question_text: str) -> str:
     # Design/build/architect phrasing wins over a narrower domain keyword below --
     # "design a highly available EKS platform" is an architecture question, not a
     # standalone kubernetes one. Checked before the domain-specific categories.
+    # Anaphoric design follow-up -- "what would that look like if we needed this across AWS
+    # and GCP?" is an architecture question whose subject lives in the previous turn. It has
+    # no design keyword of its own, so it was landing in the `default` catch-all. Narrow
+    # enough that it cannot take a genuine definition or comparison question.
+    if re.search(r"\bwhat would (?:that|this|it) look like\b", t):
+        return "architecture"
+
     is_design_phrasing = any(m in t for m in (
         "design a ", "design an ", "design the ", "design your ", "design our ",
         "how would you design", "architect a ", "architect an ",
+        # Inverted order, which is what a contracted "how you'd design" expands to.
+        # Added 2026-09-03: "take me through how you'd design this for multiple AWS
+        # accounts" was landing in the `default` catch-all purely on word order.
+        "how you would design", "how you would build", "how you would architect",
+        "how you would approach", "how you would set up", "how you would structure",
         "how would you build", "build a system", "build a platform",
         "propose an architecture", "system design", "design the architecture",
         "how would you architect", "target-state architecture", "target state architecture",
@@ -288,8 +352,9 @@ def _classify_category(question_text: str) -> str:
     if re.search(
         r"\b(suppose|let's say|lets say|say you|imagine|picture this)\b", t
     ) and re.search(
-        r"\b(fail|fails|failing|failed|down|broken|breaks|error|errors|denied|"
-        r"can't|cannot|timeout|times out|stuck|slow|unable)\b",
+        r"\b(fail|fails|failing|failed|down|broken|breaks|break|error|errors|denied|"
+        r"crash|crashes|crashing|crashed|hang|hangs|hanging|flapping|restarting|"
+        r"can't|cannot|timeout|timing out|times out|stuck|slow|unable|degraded)\b",
         t,
     ):
         return "scenario_troubleshooting"
