@@ -240,6 +240,56 @@ _FRAGMENT_STARTERS = (
 )
 
 
+# Openers that signal this segment hangs off the PREVIOUS clause -- it completes,
+# qualifies, or adds scope, rather than starting a new question. Deliberately narrower than
+# _FRAGMENT_STARTERS: bare articles/pronouns ("the", "this", "that") and location
+# prepositions ("in", "on", "at") are dropped because a real new question often opens with
+# them ("In Kubernetes, how do you...?"), whereas nothing below naturally opens a fresh,
+# independent interview question.
+_CONTINUATION_OPENERS = (
+    "and", "or", "but", "also", "plus", "with", "without", "for", "from", "into",
+    "across", "alongside", "specifically", "particularly", "especially", "including",
+    "regarding", "concerning", "considering", "given", "using", "versus", "vs",
+    "as well as", "along with",
+)
+
+# A trailing continuation is a QUALIFIER, not a whole new sentence. A segment that opens
+# with a connective but runs long is far more likely to be a full standalone question that
+# just happens to start with "for"/"given" ("For a bank with 10,000 microservices, how
+# would you design the platform?") -- those should still split.
+_MAX_WORDS_FOR_TRAILING_CONTINUATION = 12
+
+
+def _is_trailing_continuation(text: str) -> bool:
+    """True when this segment grammatically CONTINUES a previous utterance rather than
+    starting a new one -- it opens with a connective ("for GCP and AWS with multi-cloud",
+    "and how would that scale", "with multi-region failover") and is short enough to be a
+    qualifier rather than a new sentence.
+
+    Such a segment completes, qualifies, or adds scope to the question already asked, so it
+    belongs merged onto that question NO MATTER HOW LONG the interviewer paused -- a 20s
+    thinking pause between "How can you architect Terraform..." and "...for GCP and AWS" is
+    still one question. This is the signal that lets the merge ignore the revision-window
+    clock, which is otherwise the only thing keeping a late continuation attached.
+
+    An explicit pivot still wins: "and now let's move on to Kubernetes" opens with "and"
+    but _looks_like_new_question fires on "let's move on", so this returns False and the
+    segment starts its own turn.
+    """
+    lowered = text.lower().strip().strip("\"'“”")
+    if not lowered:
+        return False
+    if _looks_like_new_question(text):
+        return False
+    words = lowered.split()
+    if len(words) > _MAX_WORDS_FOR_TRAILING_CONTINUATION:
+        return False
+    first = words[0].strip(".,!?;:")
+    first_two = " ".join(w.strip(".,!?;:") for w in words[:2])
+    first_three = " ".join(w.strip(".,!?;:") for w in words[:3])
+    return first in _CONTINUATION_OPENERS or first_two in _CONTINUATION_OPENERS or first_three in _CONTINUATION_OPENERS
+
+
 # Deterministic, code-level backstop for "asks the interviewer to clarify" -- proven live
 # 2026-08-13 that prompt instructions alone get rephrased around indefinitely (the model
 # swaps "I need you to restate" for "I don't have visibility into what this refers to" and
@@ -629,7 +679,13 @@ class MeetingPipeline:
             # is the interviewer and speaker matching buys nothing while breaking merging.
             if (
                 pending is not None
-                and (transcript.start_time - pending.end_time) < _FRAGMENT_MERGE_GAP_SECONDS
+                and (
+                    (transcript.start_time - pending.end_time) < _FRAGMENT_MERGE_GAP_SECONDS
+                    # A grammatical continuation ("...for GCP and AWS") folds onto the still
+                    # -pending question no matter how long the interviewer paused -- an
+                    # incomplete sentence that gets completed later is one question, not two.
+                    or _is_trailing_continuation(transcript.text)
+                )
             ):
                 # Same speaker, short gap -- continuation of the same utterance. Strip a
                 # leading repeated-filler artifact from the held fragment first so it
@@ -641,8 +697,14 @@ class MeetingPipeline:
             elif (
                 pending is None
                 and self._last_answered is not None
-                and (transcript.start_time - self._last_answered.end_time)
-                < _ANSWER_REVISION_WINDOW_SECONDS
+                and (
+                    (transcript.start_time - self._last_answered.end_time)
+                    < _ANSWER_REVISION_WINDOW_SECONDS
+                    # A grammatical continuation of the answered question ("...for GCP and
+                    # AWS with multi-cloud") is still the same question however long the
+                    # pause -- the revision-window clock does not apply to it.
+                    or _is_trailing_continuation(transcript.text)
+                )
                 and _is_question_enhancement(transcript.text)  # no explicit pivot phrase
                 # A correction ALWAYS belongs in this branch: by definition it restates the
                 # question just asked, so it must replace that answer rather than start a
@@ -651,6 +713,10 @@ class MeetingPipeline:
                 and (
                     _is_correction(transcript.text)
                     or not _is_topic_change(transcript.text, self._last_answered.text)
+                    # A continuation overrides a topic-change split: "...for GCP and AWS"
+                    # may classify into a different category on its own, but it is a scope
+                    # qualifier on the prior question, not a new topic.
+                    or _is_trailing_continuation(transcript.text)
                 )
                 and self._revision_count < _MAX_REVISION_QUESTIONS
             ):
@@ -749,6 +815,11 @@ class MeetingPipeline:
         """
         lowered = transcript.text.lower().strip()
         if any(m in lowered for m in _ANAPHORA_MARKERS):
+            return False
+        # Opens with a conjunction/preposition/article ("for GCP and AWS with multi-cloud")
+        # -- grammatically a continuation of the prior utterance, so it folds in with plain
+        # concatenation, never numbered as its own "Question 2" even if STT tacked a "?" on.
+        if _is_trailing_continuation(transcript.text):
             return False
         detected = self._question_detector.detect(transcript)
         return detected is not None and detected.has_interrogative_signal

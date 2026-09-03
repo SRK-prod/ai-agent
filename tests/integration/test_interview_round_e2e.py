@@ -326,6 +326,45 @@ async def test_forced_vad_cut_pieces_remerge_into_one_question(make_pipeline):
     )
 
 
+async def test_delayed_grammatical_continuation_merges_past_the_revision_window(make_pipeline):
+    """A long thinking-pause before a continuation is still ONE question. "How can you
+    architect Terraform" [pause well past _ANSWER_REVISION_WINDOW_SECONDS] "for GCP and AWS
+    with multi-cloud?" must fold into one answer, not produce a second separate one."""
+    from meeting_copilot.pipeline.orchestrator import _ANSWER_REVISION_WINDOW_SECONDS
+
+    overlay = Overlay()
+    pipe = make_pipeline(overlay)
+    await say(pipe, overlay, "How can you architect Terraform", 0.0, 4.0)
+    gap = _ANSWER_REVISION_WINDOW_SECONDS + 10.0  # deliberately outside the revision clock
+    await say(pipe, overlay, "for GCP and AWS with multi-cloud?", 4.0 + gap, 8.0 + gap)
+
+    assert "Terraform" in overlay.visible and "multi-cloud" in overlay.visible, (
+        "the continuation did not merge with the original question"
+    )
+    assert "Question 1:" not in overlay.visible and "Question 2:" not in overlay.visible, (
+        "a grammatical continuation was numbered as a separate question instead of "
+        "concatenated"
+    )
+    assert len(overlay.answers) == 2, (
+        "expected 2 renders (original, then replaced-by-merge), got a third separate answer"
+    )
+
+
+async def test_short_complete_question_after_pause_still_splits(make_pipeline):
+    """The continuation rule must not swallow a genuinely new question. "How do you manage
+    Terraform state?" then, after a pause, "How would you secure Kubernetes?" -- both
+    complete, no connective opener -- stay two answers."""
+    overlay = Overlay()
+    pipe = make_pipeline(overlay)
+    await say(pipe, overlay, "How do you manage Terraform state?", 0.0, 4.0)
+    await say(pipe, overlay, "How would you secure Kubernetes?", 50.0, 54.0)
+
+    assert "Kubernetes" in overlay.visible
+    assert "Terraform state" not in overlay.visible, (
+        "an unrelated complete question was merged as a continuation"
+    )
+
+
 def test_vad_cap_is_configured_and_sane():
     from meeting_copilot.config import get_config
 
