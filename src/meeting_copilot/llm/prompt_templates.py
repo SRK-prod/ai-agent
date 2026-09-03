@@ -179,6 +179,16 @@ def _classify_category(question_text: str) -> str:
     ):
         return "behavioral"
 
+    # "Have you done that kind of work?" / "have you ever had to..." -- a past-experience
+    # question with no story noun and no tool name, so neither the STAR openers nor the
+    # tool rule caught it. Present-perfect + "you" is the signal.
+    if re.search(
+        r"\bhave you (?:done|handled|dealt with|supported|run|managed|built|automated|"
+        r"debugged|troubleshot|owned)\b",
+        t,
+    ):
+        return "behavioral"
+
     # PAST-TENSE PERSONAL EXPERIENCE, no story noun. "What'd you do when your Harness
     # pipeline kept failing?" expands to "what did you do when..." -- unmistakably a request
     # for what the candidate ACTUALLY DID, but it names no "time"/"example"/"situation" for
@@ -364,6 +374,26 @@ def _classify_category(question_text: str) -> str:
     if re.search(
         r"\b(curious|wondering)\b.{0,40}\b(handle|debug|troubleshoot|diagnose|"
         r"investigate|approach|deal with|fix)\b",
+        t,
+    ):
+        return "scenario_troubleshooting"
+
+    # ANAPHORIC ACTION ASK -- "how would you automate cleaning those up?", "what would you
+    # do about that?". The ask names an ACTION but no subject, because the subject was in
+    # the interviewer's previous sentence. Added 2026-09-03 after testing the cadence of the
+    # US interviewer joining today: these were landing in the `default` catch-all and
+    # rendering through the KNOWLEDGE shape at a 110-word cap, which is the wrong shape for
+    # a "what would you do" question. Conversation context is attached separately, so the
+    # model still knows what "those" refers to.
+    # The ANAPHORIC OBJECT is the whole point -- it is what makes this a follow-up about
+    # something just said rather than a design question. Without that requirement the rule
+    # stole "How would you handle secrets in GitHub Actions?", which names its own subject
+    # and is a cicd_devops design question.
+    if re.search(
+        r"\b(?:how|what)\s+would\s+you\s+"
+        r"(?:automate|handle|approach|fix|solve|tackle|deal with|do about|go about|"
+        r"address|resolve|prevent|improve|clean up|remediate)\b"
+        r"(?:\s+\w+){0,3}?\s*\b(that|those|this|it|them)\b",
         t,
     ):
         return "scenario_troubleshooting"
