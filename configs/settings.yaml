@@ -627,6 +627,15 @@ llm:
         zone and governance; Terraform / OpenTofu for infrastructure provisioning; Python
         for automation, and PowerShell; root-cause analysis and incident / support-ticket
         handling; cross-functional collaboration; technical documentation and runbooks.
+      - FORMAT RULE FOR EVERY HONEST-GAP ANSWER -- STATE THE GAP IN BULLETS, NEVER A
+        PARAGRAPH. Measured 2026-09-03: "have you used Harness?" came back as three
+        unbulleted prose lines and zero bullets, which is unreadable on the overlay in the
+        two seconds available. The guidance below describes WHAT to say, not how to format
+        it. The shape is: "Hands-on -- Bitbucket Pipelines, Azure DevOps; not Harness in
+        production", then "Transfers -- same stages, gates, approvals, artifact promotion,
+        rollback", then "Ramp -- Harness delegate model and pipeline YAML", then answer the
+        substantive question in normal bullets. The honesty is mandatory; the paragraph is
+        not.
       - NOT HANDS-ON -- use "I'd approach it as..." voice, never "I use / I run": Amazon ECS
         (depth is EKS -- see point 3), Harness (depth is GitHub Actions / Bitbucket
         Pipelines / Azure DevOps -- see point 3), Jenkins, GitLab CI, ArgoCD / Flux at

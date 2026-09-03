@@ -169,6 +169,104 @@ def _reorganize_architecture_for_pacing(text: str) -> str:
     return result_text
 
 
+# Categories whose answers are a SWEEP -- a checklist of areas the candidate glances at and
+# then talks around. These are the ones where bullet density actually hurts.
+_SWEEP_CATEGORIES = {
+    "scenario_troubleshooting", "troubleshooting", "incident_rca",
+    "architecture", "migration", "scalability", "ha_dr", "cost_finops", "security",
+    "kubernetes", "aws", "cicd_devops", "sre", "observability", "aiops",
+    "platform_engineering", "iac_terraform", "behavioral", "leadership",
+    "failure_negative", "project_ownership", "trade_off", "why_not", "tool_technology",
+    "career_narrative",
+}
+
+# Max words AFTER the 'LABEL --' part. The prompt asks for 3-8; 9 is the enforcement line,
+# so a naturally-sized bullet is never touched and only the runaway ones get cut.
+_MAX_BULLET_TAIL_WORDS = 9
+
+# 60, not 40: a label like "Real depth: Bitbucket Pipelines and GitHub Actions" is 49
+# chars and was escaping the tightener entirely (measured across the full bank).
+_LABEL_SPLIT_RE = re.compile(r"^(.{1,60}?)\s+(?:--|—|–)\s+(.*)$")
+_BULLET_LINE_RE = re.compile(r"^(\s*[*\-•]\s+)(.*)$")
+_BACKTICK_RE = re.compile(r"`[^`]*`")
+
+
+def _tighten_tail(tail: str) -> str:
+    """Cut an explanatory bullet tail back to a glanceable area descriptor.
+
+    Prefers a natural boundary in this order: a semicolon (always an appended second
+    thought), a second '--' (a nested explanation), then the last comma inside the word
+    budget, and only then a hard word cut. Inline commands in backticks are dropped -- the
+    overlay is a memory trigger, and the candidate knows the command.
+    """
+    tail = _BACKTICK_RE.sub("", tail)
+    for sep in (";", " -- ", " — "):
+        if sep in tail:
+            tail = tail.split(sep, 1)[0]
+    tail = tail.strip().rstrip(",")
+
+    words = tail.split()
+    if len(words) <= _MAX_BULLET_TAIL_WORDS:
+        return tail
+
+    head = " ".join(words[:_MAX_BULLET_TAIL_WORDS])
+    # Cutting at the last comma reads as a finished list rather than a severed sentence.
+    if "," in head:
+        cut = head.rsplit(",", 1)[0]
+        if len(cut.split()) >= 3:
+            return cut
+    return head.rstrip(",")
+
+
+def _tighten_bullets(text: str) -> str:
+    """Deterministic backstop for bullet density -- same rationale as
+    _cap_definition_length above.
+
+    Added 2026-09-03 after five rounds of prompt tightening failed to hold the line: real
+    output kept coming back at 20-30 words per bullet with inline CLI commands, which is
+    unreadable in the two seconds a candidate has while the interviewer is still speaking.
+    Live feedback was explicit -- the overlay should carry short memory triggers and the
+    candidate supplies the explanation out loud. Prompt instructions are a request; this is
+    the guarantee.
+
+    Deliberately conservative: it only ever SHORTENS an over-long bullet at a natural
+    boundary, never rewrites wording, never touches fenced code, headings, ASCII flow
+    lines, or a bullet that is already short enough.
+    """
+    out = []
+    in_code = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            in_code = not in_code
+            out.append(line)
+            continue
+        if in_code:
+            out.append(line)
+            continue
+        m = _BULLET_LINE_RE.match(line)
+        if not m:
+            out.append(line)
+            continue
+        prefix, body = m.group(1), m.group(2)
+        label_m = _LABEL_SPLIT_RE.match(body)
+        if not label_m:
+            # No 'LABEL --' structure; leave it alone rather than guess where to cut.
+            out.append(line)
+            continue
+        label, tail = label_m.group(1).strip(), label_m.group(2).strip()
+        tightened = _tighten_tail(tail)
+        if not tightened:
+            out.append(line)
+            continue
+        out.append(f"{prefix}{label} -- {tightened}")
+    # splitlines() drops a trailing newline; markdown rendering can care about it, and a
+    # pass-through helper should be byte-identical when it changes nothing.
+    result = "\n".join(out)
+    if text.endswith("\n"):
+        result += "\n"
+    return result
+
+
 class AnswerOptimizer:
     def __init__(self, config: LlmConfig | None = None):
         self._cfg = config or get_config().llm
@@ -180,6 +278,8 @@ class AnswerOptimizer:
             text = _cap_definition_length(text)
         elif category == "architecture" and len(text.split()) > 500:
             text = _reorganize_architecture_for_pacing(text)
+        if category in _SWEEP_CATEGORIES:
+            text = _tighten_bullets(text)
         format_type = detect_format_type(context.question, text)
         low_confidence = confidence < self._cfg.low_confidence_threshold
         if low_confidence:

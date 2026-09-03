@@ -65,6 +65,10 @@ QUESTION_BANK: list[tuple[str, str]] = [
     ("knowledge", "How does Terraform work?"),
     ("rapidfire", "What is a security group?"),
     ("comparison", "ECS vs EKS - which would you choose?"),
+    ("glance", "An ECS deployment is intermittently failing in production. How would you troubleshoot it?"),
+    ("star", "Tell me about a time you automated a repetitive DevOps support task using Python"),
+    ("gap", "Have you used Harness before?"),
+    ("gap", "What is your experience with Amazon ECS?"),
 ]
 
 _MAX_BULLET_WORDS = 14
